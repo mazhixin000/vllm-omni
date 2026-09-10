@@ -818,6 +818,28 @@ class LightProjector(nn.Module):
         return self.layers(x)
 
 
+def _apply_hunyuan_image3_rope(
+    rope: RotaryEmbedding,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply image RoPE to Q/K through the current platform implementation.
+
+    The default path preserves the existing behavior of applying the single-input
+    RoPE operator to query and key independently. Ascend uses a model-local helper
+    that can replace those two launches with ``npu_apply_rotary_pos_emb`` without
+    adding a torch-npu dependency to this platform-neutral model module.
+    """
+    if current_omni_platform.is_npu():
+        from vllm_omni.platforms.npu.models.hunyuan_image3 import apply_hunyuan_image3_rope_npu
+
+        return apply_hunyuan_image3_rope_npu(rope, query, key, cos, sin)
+
+    return rope(query, cos, sin), rope(key, cos, sin)
+
+
 class HunYuanRotary2DEmbedder:
     r"""
     A RoPE wrapper specifically designed for HunYuan-Image attention.
@@ -898,15 +920,19 @@ class HunYuanRotary2DEmbedder:
         q_len = query_lens[0]
         assert hidden_states.shape[0] == bs * q_len, f"{hidden_states.shape[0]} != {bs * q_len}"
 
-        # 3. Reshape + transpose for apply_rotary_pos_emb
-        #    Assume q shape [B*L, H*D] -> [2, L, H, D] -> [2, H, L, D]
-        q = q.reshape(bs, q_len, self.num_heads, self.head_dim)
-        k = k.reshape(bs, q_len, self.num_kv_heads, self.head_dim)
+        # 3. Restore the BSND layout expected by the image RoPE kernels.
+        #    q: [B*L, Hq*D] -> [B, L, Hq, D]
+        #    k: [B*L, Hkv*D] -> [B, L, Hkv, D]
+        q = q.reshape(bs, q_len, self.num_heads, self.head_dim).to(torch.float32)
+        k = k.reshape(bs, q_len, self.num_kv_heads, self.head_dim).to(torch.float32)
 
-        q = self.rope(q.to(torch.float32), cos, sin)
-        k = self.rope(k.to(torch.float32), cos, sin)
+        # Keep the established FP32 RoPE path. On Ascend, the platform helper
+        # applies RoPE to Q and K in one fused launch when the official API is
+        # available; other platforms and older torch-npu versions retain the
+        # existing pair of single-input calls.
+        q, k = _apply_hunyuan_image3_rope(self.rope, q, k, cos, sin)
 
-        # 5. Restore original shape + convert to bfloat16
+        # 4. Restore original shape + convert to bfloat16
         q = q.reshape(hidden_states.shape[0], self.num_heads * self.head_dim).to(torch.bfloat16)
         k = k.reshape(hidden_states.shape[0], self.num_kv_heads * self.head_dim).to(torch.bfloat16)
         hidden_states = hidden_states.reshape(hidden_states_shape)
