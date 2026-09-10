@@ -48,12 +48,14 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
             elif activity == "NPU":
                 npu_activities.append(torch_npu.profiler.ProfilerActivity.NPU)
 
-        # NPU-specific experimental config for detailed profiling
+        # PipeUtilization records AI Core pipeline metrics (including AIC/AIV
+        # utilization) in the raw NPU profile. Offline analysis can only export
+        # metrics collected here; AiCoreNone produces traces without them.
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             export_type=torch_npu.profiler.ExportType.Text,
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
             msprof_tx=False,
-            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
             l2_cache=False,
             op_attr=False,
             data_simplification=True,
