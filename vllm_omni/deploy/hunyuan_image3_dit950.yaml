@@ -8,10 +8,14 @@ async_chunk: false
 stages:
   - stage_id: 0
     max_num_seqs: 1
-    gpu_memory_utilization: 0.65
+    gpu_memory_utilization: 0.9
     enforce_eager: true
     devices: "0,1,2,3"
+    # 当前 Distil 模型在 TP=1 下每卡复制完整权重会 OOM，使用已验证的 TP=4 + EP。
+    additional_config:
+      multistream_overlap_shared_expert: true
     vae_use_slicing: false
+    # VAE patch parallel 依赖 tiling；显式开启，避免仅依赖运行时自动修正。
     vae_use_tiling: true
     cache_backend:
     cache_config:
@@ -20,7 +24,7 @@ stages:
       pipeline_parallel_size: 1
       data_parallel_size: 1
       tensor_parallel_size: 4
-      enable_expert_parallel: false
+      enable_expert_parallel: true
       sequence_parallel_size: 1
       ulysses_degree: 1
       ring_degree: 1
@@ -40,9 +44,25 @@ platforms:
         gpu_memory_utilization: 0.65
         devices: "0,1,2,3"
         max_num_batched_tokens: 32768
-        # parallel_config:
-        #   tensor_parallel_size: 4
-        #   enable_expert_parallel: false
+        vae_use_tiling: true
+        additional_config:
+          multistream_overlap_shared_expert: true
+        # platform overlay 会整体替换基础 parallel_config，因此需在此完整声明。
+        parallel_config:
+          pipeline_parallel_size: 1
+          data_parallel_size: 1
+          tensor_parallel_size: 4
+          enable_expert_parallel: true
+          sequence_parallel_size: 1
+          ulysses_degree: 1
+          ring_degree: 1
+          allgather_degree: 1
+          cfg_parallel_size: 1
+          vae_patch_parallel_size: 4
+          vae_parallel_mode: tile
+          use_hsdp: false
+          hsdp_shard_size: -1
+          hsdp_replicate_size: 1
 
   xpu:
     stages:
