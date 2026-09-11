@@ -36,16 +36,7 @@ def is_hunyuan_image3_fused_rope_enabled() -> bool:
     return value in _ENABLED_VALUES
 
 
-def is_hunyuan_image3_fused_rope_available() -> bool:
-    """Return whether fused RoPE is enabled and available in torch-npu."""
-    return is_hunyuan_image3_fused_rope_enabled() and getattr(
-        torch_npu,
-        "npu_apply_rotary_pos_emb",
-        None,
-    ) is not None
-
-
-def prepare_hunyuan_image3_rope_frequencies_npu(
+def _prepare_half_rope_frequencies(
     cos: torch.Tensor,
     sin: torch.Tensor,
     *,
@@ -55,50 +46,36 @@ def prepare_hunyuan_image3_rope_frequencies_npu(
     dtype: torch.dtype,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Normalize Hunyuan frequencies for ApplyRotaryPosEmb's BSND layout.
+    """Convert Hunyuan half-width frequencies to ApplyRotaryPosEmb BSND inputs.
 
-    Half-width inputs ``[B, S, D/2]`` are materialized once as
-    ``[B, S, 1, D]``. Already prepared full-width inputs are returned without
-    another concatenation, allowing all decoder layers to share one pair.
+    Hunyuan stores one cosine/sine value for every NeoX pair, so the source
+    tensors end in ``head_dim // 2``. ApplyRotaryPosEmb consumes full-width
+    frequencies with a singleton head dimension. Duplicating the complete
+    half-width vector, rather than repeating each element, preserves the pairs
+    ``(x[i], x[i + head_dim // 2])`` used by ``rotary_mode="half"``.
     """
     if cos.shape != sin.shape:
         raise ValueError(f"cos and sin must have identical shapes, got {cos.shape} and {sin.shape}")
     if cos.ndim == 2:
         cos = cos.unsqueeze(0)
         sin = sin.unsqueeze(0)
-
-    if cos.ndim == 3:
-        if cos.shape[1] != seq_len:
-            raise ValueError(f"RoPE sequence length mismatch: expected {seq_len}, got {cos.shape[1]}")
-        if cos.shape[-1] * 2 != head_dim:
-            raise ValueError(f"RoPE frequency width must be half of head_dim={head_dim}, got {cos.shape[-1]}")
-        cos = cos.to(device=device, dtype=dtype)
-        sin = sin.to(device=device, dtype=dtype)
-        cos = torch.cat((cos, cos), dim=-1).unsqueeze(2)
-        sin = torch.cat((sin, sin), dim=-1).unsqueeze(2)
-    elif cos.ndim == 4:
-        expected_tail = (seq_len, 1, head_dim)
-        if cos.shape[1:] != expected_tail:
-            raise ValueError(
-                "Prepared RoPE frequencies must be [B, S, 1, D], "
-                f"expected tail {expected_tail}, got {cos.shape}"
-            )
-        cos = cos.to(device=device, dtype=dtype)
-        sin = sin.to(device=device, dtype=dtype)
-    else:
-        raise ValueError(
-            "Hunyuan RoPE frequencies must be [S, D/2], [B, S, D/2], "
-            f"or [B, S, 1, D], got {cos.shape}"
-        )
+    if cos.ndim != 3:
+        raise ValueError(f"Hunyuan RoPE frequencies must be [B, S, D/2] or [S, D/2], got {cos.shape}")
+    if cos.shape[1] != seq_len:
+        raise ValueError(f"RoPE sequence length mismatch: expected {seq_len}, got {cos.shape[1]}")
+    if cos.shape[-1] * 2 != head_dim:
+        raise ValueError(f"RoPE frequency width must be half of head_dim={head_dim}, got {cos.shape[-1]}")
 
     freq_batch = cos.shape[0]
     if freq_batch == 1 and batch_size != 1:
-        cos = cos.expand(batch_size, *cos.shape[1:])
-        sin = sin.expand(batch_size, *sin.shape[1:])
+        cos = cos.expand(batch_size, -1, -1)
+        sin = sin.expand(batch_size, -1, -1)
     elif freq_batch != batch_size:
         raise ValueError(f"RoPE batch size must be 1 or {batch_size}, got {freq_batch}")
 
-    return cos.contiguous(), sin.contiguous()
+    cos = torch.cat((cos, cos), dim=-1).unsqueeze(2).to(device=device, dtype=dtype).contiguous()
+    sin = torch.cat((sin, sin), dim=-1).unsqueeze(2).to(device=device, dtype=dtype).contiguous()
+    return cos, sin
 
 
 def apply_hunyuan_image3_rope_npu(
@@ -149,7 +126,7 @@ def apply_hunyuan_image3_rope_npu(
     batch_size, seq_len, _, head_dim = query.shape
     # query = query.contiguous()
     # key = key.contiguous()
-    cos, sin = prepare_hunyuan_image3_rope_frequencies_npu(
+    cos, sin = _prepare_half_rope_frequencies(
         cos,
         sin,
         batch_size=batch_size,
@@ -169,9 +146,4 @@ def apply_hunyuan_image3_rope_npu(
     )
 
 
-__all__ = [
-    "apply_hunyuan_image3_rope_npu",
-    "is_hunyuan_image3_fused_rope_available",
-    "is_hunyuan_image3_fused_rope_enabled",
-    "prepare_hunyuan_image3_rope_frequencies_npu",
-]
+__all__ = ["apply_hunyuan_image3_rope_npu"]

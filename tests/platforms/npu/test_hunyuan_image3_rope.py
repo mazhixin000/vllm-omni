@@ -141,7 +141,7 @@ def test_hunyuan_image3_fused_rope_switch_restores_original_path(
 
     monkeypatch.setattr(
         module,
-        "prepare_hunyuan_image3_rope_frequencies_npu",
+        "_prepare_half_rope_frequencies",
         unexpected_frequency_preparation,
     )
     query = torch.zeros(1, 3, 2, 8)
@@ -157,7 +157,7 @@ def test_hunyuan_image3_fused_rope_switch_restores_original_path(
         sin,
     )
 
-    assert not module.is_hunyuan_image3_fused_rope_available()
+    assert not module.is_hunyuan_image3_fused_rope_enabled()
     assert len(calls) == 2
     assert calls[0][0] is query
     assert calls[0][1] is cos
@@ -167,60 +167,3 @@ def test_hunyuan_image3_fused_rope_switch_restores_original_path(
     assert calls[1][2] is sin
     torch.testing.assert_close(actual_query, query + 1)
     torch.testing.assert_close(actual_key, key + 2)
-
-
-def test_hunyuan_image3_npu_rope_reuses_prepared_full_width_frequencies(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Per-layer calls must not concatenate frequencies prepared by the model."""
-    monkeypatch.delenv("VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_ROPE", raising=False)
-    calls = []
-
-    def npu_apply_rotary_pos_emb(query, key, cos, sin, *, layout, rotary_mode):
-        calls.append((cos, sin, layout, rotary_mode))
-        return query, key
-
-    module = _load_npu_rope_module(
-        monkeypatch,
-        npu_apply_rotary_pos_emb=npu_apply_rotary_pos_emb,
-    )
-    query = torch.randn(1, 17, 8, 128)
-    key = torch.randn(1, 17, 2, 128)
-    cos = torch.randn(1, 17, 1, 128)
-    sin = torch.randn_like(cos)
-
-    def unexpected_cat(*_args, **_kwargs):
-        raise AssertionError("prepared full-width frequencies must not be concatenated again")
-
-    monkeypatch.setattr(torch, "cat", unexpected_cat)
-    module.apply_hunyuan_image3_rope_npu(lambda *_args: None, query, key, cos, sin)
-
-    fused_cos, fused_sin, layout, rotary_mode = calls[0]
-    assert fused_cos is cos
-    assert fused_sin is sin
-    assert layout == "BSND"
-    assert rotary_mode == "half"
-
-
-def test_prepared_frequencies_do_not_reuse_another_request_cache() -> None:
-    """Full-width frequencies always belong to the current model forward."""
-    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
-        HunYuanRotary2DEmbedder,
-    )
-
-    embedder = HunYuanRotary2DEmbedder.__new__(HunYuanRotary2DEmbedder)
-    embedder.custom_pos_emb = (
-        torch.full((1, 3, 1, 8), -1.0),
-        torch.full((1, 3, 1, 8), -1.0),
-    )
-    current_cos = torch.randn(1, 3, 1, 8)
-    current_sin = torch.randn_like(current_cos)
-
-    actual_cos, actual_sin = embedder._prepare_cos_sin(
-        (current_cos, current_sin),
-        first_step=False,
-        device=current_cos.device,
-    )
-
-    assert actual_cos is current_cos
-    assert actual_sin is current_sin
