@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
+import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer as transformer_module
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
@@ -369,3 +372,171 @@ def test_denoise_step_uses_input_batch_group_order_and_splits_back(monkeypatch):
     assert states[1].extra[_STEP_MODEL_KWARGS]["attention_mask"].shape == (2, 1, 2, 6)
     assert states[0].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(2, 4)], [(2, 4)]]
     assert states[1].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(4, 6)], [(4, 6)]]
+
+
+@pytest.mark.parametrize(("batch_size", "seq_len"), [(1, 17), (2, 4097)])
+def test_model_level_rope_preexpand_is_shared_without_layer_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+    seq_len: int,
+):
+    """Prepare once per forward and let every layer consume the current pair."""
+    prepare_calls = []
+
+    def prepare(cos, sin, **kwargs):
+        prepare_calls.append((cos, sin, kwargs))
+        return (
+            torch.cat((cos, cos), dim=-1).unsqueeze(2),
+            torch.cat((sin, sin), dim=-1).unsqueeze(2),
+        )
+
+    fake_npu_helper = SimpleNamespace(
+        can_preexpand_hunyuan_image3_rope=lambda: True,
+        prepare_hunyuan_image3_rope_frequencies_npu=prepare,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms.npu.models.hunyuan_image3",
+        fake_npu_helper,
+    )
+    monkeypatch.setattr(transformer_module.current_omni_platform, "is_npu", lambda: True)
+
+    hidden_states = torch.zeros(batch_size, seq_len, 16)
+    cos = torch.randn(batch_size, seq_len, 4)
+    sin = torch.randn_like(cos)
+    prepared = transformer_module._prepare_hunyuan_image3_rope_frequencies(
+        (cos, sin),
+        hidden_states,
+        mode="gen_image",
+        head_dim=8,
+    )
+
+    assert prepared is not None
+    assert len(prepare_calls) == 1
+    assert prepare_calls[0][2] == {
+        "batch_size": batch_size,
+        "seq_len": seq_len,
+        "head_dim": 8,
+        "dtype": torch.float32,
+        "device": hidden_states.device,
+    }
+
+    prepared_cos, prepared_sin = prepared
+    assert prepared_cos.shape == (batch_size, seq_len, 1, 8)
+    assert prepared_sin.shape == prepared_cos.shape
+
+    # Simulate two decoder layers containing stale half-width state from an
+    # earlier request. Both must use the same current full-width objects.
+    for _ in range(2):
+        embedder = transformer_module.HunYuanRotary2DEmbedder(2, 1, 8)
+        embedder.custom_pos_emb = (torch.zeros(1, 3, 4), torch.zeros(1, 3, 4))
+
+        actual_cos, actual_sin = embedder._prepare_cos_sin(
+            prepared,
+            first_step=False,
+            device=hidden_states.device,
+        )
+
+        assert actual_cos is prepared_cos
+        assert actual_sin is prepared_sin
+        assert embedder.custom_pos_emb is None
+
+
+def test_model_forward_preexpands_once_and_shares_with_all_local_layers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The real model loop prepares after input shaping and reuses one tuple."""
+    prepare_calls = []
+    layer_inputs = []
+
+    def prepare(cos, sin, **kwargs):
+        prepare_calls.append((cos, sin, kwargs))
+        return (
+            torch.cat((cos, cos), dim=-1).unsqueeze(2),
+            torch.cat((sin, sin), dim=-1).unsqueeze(2),
+        )
+
+    fake_npu_helper = SimpleNamespace(
+        can_preexpand_hunyuan_image3_rope=lambda: True,
+        prepare_hunyuan_image3_rope_frequencies_npu=prepare,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms.npu.models.hunyuan_image3",
+        fake_npu_helper,
+    )
+    monkeypatch.setattr(transformer_module.current_omni_platform, "is_npu", lambda: True)
+    monkeypatch.setattr(
+        transformer_module.current_omni_platform,
+        "reset_diffusion_fused_moe_forward_context",
+        lambda: None,
+    )
+    monkeypatch.setattr(transformer_module, "get_sequence_parallel_world_size", lambda: 1)
+
+    class RecordingLayer(nn.Module):
+        def forward(self, *, hidden_states, custom_pos_emb, **kwargs):
+            del kwargs
+            layer_inputs.append(custom_pos_emb)
+            return (hidden_states,)
+
+    model = transformer_module.HunyuanImage3Model.__new__(transformer_module.HunyuanImage3Model)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        output_attentions=False,
+        output_hidden_states=False,
+        use_cache=False,
+        use_return_dict=False,
+        head_dim=8,
+    )
+    model.rope_head_dim = 8
+    model.layers = nn.ModuleList([RecordingLayer(), RecordingLayer()])
+
+    hidden_states = torch.zeros(1, 7, 16)
+    cos = torch.randn(1, 7, 4)
+    sin = torch.randn_like(cos)
+    outputs = model(
+        inputs_embeds=hidden_states,
+        custom_pos_emb=(cos, sin),
+        mode="gen_image",
+        first_step=False,
+        query_lens=[7],
+        seq_lens=[7],
+        return_dict=False,
+    )
+
+    assert len(prepare_calls) == 1
+    assert len(layer_inputs) == 2
+    assert layer_inputs[0] is layer_inputs[1]
+    assert layer_inputs[0][0].shape == (1, 7, 1, 8)
+    assert outputs[0] is hidden_states
+
+
+def test_model_level_rope_preexpand_leaves_non_image_path_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Text generation never imports or applies the image-only NPU preparation."""
+    monkeypatch.setattr(transformer_module.current_omni_platform, "is_npu", lambda: True)
+    custom_pos_emb = (torch.ones(1, 3, 4), torch.zeros(1, 3, 4))
+
+    actual = transformer_module._prepare_hunyuan_image3_rope_frequencies(
+        custom_pos_emb,
+        torch.zeros(1, 3, 8),
+        mode="gen_text",
+        head_dim=8,
+    )
+
+    assert actual is custom_pos_emb
+
+
+def test_preexpanded_rope_requires_matching_rank():
+    """A mixed half/full pair is rejected before stale state can be observed."""
+    embedder = transformer_module.HunYuanRotary2DEmbedder(2, 1, 8)
+    cos_full = torch.ones(1, 3, 1, 8)
+    sin_half = torch.zeros(1, 3, 4)
+
+    with pytest.raises(ValueError, match="both be four-dimensional"):
+        embedder._prepare_cos_sin(
+            (cos_full, sin_half),
+            first_step=False,
+            device=torch.device("cpu"),
+        )

@@ -85,6 +85,22 @@ example and the DiT sections below.
 export CACHE_DIT_VERSION=1.3.0
 ```
 
+On Ascend, the HunyuanImage3 Q/K fused RoPE and model-level cos/sin
+pre-expansion optimizations are enabled by default. The switches below are
+intended only for isolated regression or performance comparisons:
+
+```bash
+# Disable only model-level cos/sin pre-expansion. Fused Q/K RoPE stays enabled.
+export VLLM_OMNI_HUNYUAN_IMAGE3_ROPE_PREEXPAND=0
+
+# Disable fused Q/K RoPE and use the original two-call implementation.
+export VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_ROPE=0
+
+# Restore the default optimized path.
+unset VLLM_OMNI_HUNYUAN_IMAGE3_ROPE_PREEXPAND
+unset VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_ROPE
+```
+
 HunyuanImage-3.0 sets the diffusion attention backend to `TORCH_SDPA`
 internally because the model mixes causal and full attention.
 

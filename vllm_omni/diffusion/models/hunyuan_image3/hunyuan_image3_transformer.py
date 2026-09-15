@@ -849,6 +849,42 @@ class LightProjector(nn.Module):
         return self.layers(x)
 
 
+def _prepare_hunyuan_image3_rope_frequencies(
+    custom_pos_emb: tuple[torch.Tensor, torch.Tensor] | None,
+    hidden_states: torch.Tensor,
+    mode: str,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Prepare one full-width RoPE pair for all local decoder layers.
+
+    Position selection and sequence-parallel sharding intentionally happen
+    before this helper. Consequently, only the current rank's current-query
+    frequencies are materialized. Non-NPU and non-image paths remain unchanged.
+    """
+    if mode != "gen_image" or custom_pos_emb is None or not current_omni_platform.is_npu():
+        return custom_pos_emb
+
+    from vllm_omni.platforms.npu.models.hunyuan_image3 import (
+        can_preexpand_hunyuan_image3_rope,
+        prepare_hunyuan_image3_rope_frequencies_npu,
+    )
+
+    # Check if the user has manually closed it
+    if not can_preexpand_hunyuan_image3_rope():
+        return custom_pos_emb
+
+    cos, sin = custom_pos_emb
+    return prepare_hunyuan_image3_rope_frequencies_npu(
+        cos,
+        sin,
+        batch_size=hidden_states.shape[0],
+        seq_len=hidden_states.shape[1],
+        head_dim=head_dim,
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+
+
 def _apply_hunyuan_image3_rope(
     rope: RotaryEmbedding,
     query: torch.Tensor,
@@ -911,9 +947,28 @@ class HunYuanRotary2DEmbedder:
         first_step: bool,
         device: torch.device,
     ):
-        """Returns cos/sin on the target device based on first_step and caching strategy."""
+        """Return current cos/sin while preserving the half-width cache policy.
+
+        Model-level pre-expanded tensors are request-local and already shared
+        by all decoder layers. They must bypass the layer-local half-width cache
+        so a previous request can never replace the current forward's values.
+        """
+        cos_input, sin_input = custom_pos_emb
+        if cos_input.ndim == 4 or sin_input.ndim == 4:
+            if cos_input.ndim != 4 or sin_input.ndim != 4:
+                raise ValueError("Pre-expanded cos and sin must both be four-dimensional")
+            if cos_input.shape != sin_input.shape:
+                raise ValueError("Pre-expanded cos and sin must have identical shapes")
+            if cos_input.shape[2] != 1 or cos_input.shape[-1] != self.head_dim:
+                raise ValueError(
+                    f"Pre-expanded RoPE frequencies must have shape [B, S, 1, {self.head_dim}], got {cos_input.shape}"
+                )
+            self.custom_pos_emb = None
+            if cos_input.device != device:
+                return cos_input.to(device), sin_input.to(device)
+            return cos_input, sin_input
+
         if first_step:
-            cos_input, sin_input = custom_pos_emb
             cos = cos_input.to(device)
             sin = sin_input.to(device)
             self.custom_pos_emb = None
@@ -2086,8 +2141,8 @@ class HunyuanImage3Model(nn.Module):
         "pre_processor": {
             1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
             3: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True, auto_pad=True),
-            5: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # sin
-            7: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # cos
+            5: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # cos
+            7: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # sin
         },
         "post_processor": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
@@ -2098,6 +2153,12 @@ class HunyuanImage3Model(nn.Module):
         self.num_redundant_experts = 0
         self.config = config
         self.device = get_local_device()
+        if getattr(config, "head_dim", None):
+            self.rope_head_dim = config.head_dim
+        elif getattr(config, "attention_head_dim", None):
+            self.rope_head_dim = config.attention_head_dim
+        else:
+            self.rope_head_dim = config.hidden_size // config.num_attention_heads
 
         self.quant_config = quant_config
         logger.debug(f"quant_config: {quant_config}")
@@ -2471,10 +2532,10 @@ class HunyuanImage3Model(nn.Module):
                 image_hidden_states,
                 text_position_ids,
                 image_position_ids,
-                text_custom_pos_emb_sin,
-                image_custom_pos_emb_sin,
                 text_custom_pos_emb_cos,
                 image_custom_pos_emb_cos,
+                text_custom_pos_emb_sin,
+                image_custom_pos_emb_sin,
             ) = self.pre_processor(
                 hidden_states,
                 custom_pos_emb,
@@ -2505,13 +2566,13 @@ class HunyuanImage3Model(nn.Module):
                 hidden_states = self.unifiled_cat(text_hidden_states, image_hidden_states, dim=1)
                 position_ids = self.unifiled_cat(text_position_ids, image_position_ids, dim=1)
                 custom_pos_emb = (
-                    self.unifiled_cat(text_custom_pos_emb_sin, image_custom_pos_emb_sin, dim=1),
                     self.unifiled_cat(text_custom_pos_emb_cos, image_custom_pos_emb_cos, dim=1),
+                    self.unifiled_cat(text_custom_pos_emb_sin, image_custom_pos_emb_sin, dim=1),
                 )
             else:
                 hidden_states = image_hidden_states
                 position_ids = image_position_ids
-                custom_pos_emb = (image_custom_pos_emb_sin, image_custom_pos_emb_cos)
+                custom_pos_emb = (image_custom_pos_emb_cos, image_custom_pos_emb_sin)
 
             if shard_padding_size > 0:
                 B, H, Q, K = attention_mask.shape
@@ -2522,6 +2583,16 @@ class HunyuanImage3Model(nn.Module):
 
                 k_pad = attention_mask.new_zeros(B, H, Q + pad, pad)
                 attention_mask = torch.cat((attention_mask, k_pad), dim=3)
+
+        # Sequence-parallel sharding must finish before expansion so each rank
+        # materializes only its local query positions. The resulting full-width
+        # pair is shared by every decoder layer in this model forward.
+        custom_pos_emb = _prepare_hunyuan_image3_rope_frequencies(
+            custom_pos_emb,
+            hidden_states,
+            mode,
+            self.rope_head_dim,
+        )
 
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
