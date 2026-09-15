@@ -18,8 +18,9 @@ import torch.nn as nn
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _TRANSFORMER_MODULE = "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer"
+_COMPRESSED_KV_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_COMPRESSED_KV"
 
-NUM_HEADS = 4
+NUM_HEADS = 8
 NUM_KV_HEADS = 2
 HEAD_DIM = 16
 IMAGE_TOKEN_LEN = 8
@@ -35,8 +36,16 @@ SCALING = 1.0 / math.sqrt(HEAD_DIM)
 class MockAttention(nn.Module):
     def __init__(self, num_heads, head_size, causal=False, softmax_scale=None, num_kv_heads=None, **kwargs):
         super().__init__()
+        self.last_key = None
+        self.last_value = None
+        self.last_attn_metadata = None
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
+        self.last_key = key
+        self.last_value = value
+        self.last_attn_metadata = attn_metadata
+        if attn_metadata is not None and attn_metadata.joint_query is not None:
+            return torch.cat((attn_metadata.joint_query, query), dim=1)
         return query
 
 
@@ -45,7 +54,6 @@ def patched_mgr_env(sp_size=1):
     target = _TRANSFORMER_MODULE
     patches = [
         patch(f"{target}.get_sequence_parallel_world_size", return_value=sp_size),
-        patch(f"{target}.get_allgather_parallel_world_size", return_value=sp_size),
         patch(f"{target}.get_ulysses_parallel_world_size", return_value=1, create=True),
         patch(f"{target}.get_sequence_parallel_rank", return_value=0),
         patch(f"{target}.Attention", MockAttention),
@@ -500,3 +508,62 @@ def test_cross_request_isolation():
     assert torch.allclose(cached_value[0, :prompt_len], v_flat[:prompt_len])
     # Stale values must not be present
     assert not torch.any(cached_key >= 999.0)
+
+
+# ============================================================
+# Test 5: HunyuanImage3 compressed K/V optimization switch
+# ============================================================
+
+
+def _run_first_step(mgr, sp_size):
+    prompt_len = 3
+    shard_image_size = 4 if sp_size > 1 else None
+    q_len = prompt_len + 4
+    key_flat = torch.arange(q_len * NUM_KV_HEADS * HEAD_DIM, dtype=torch.float32).reshape(q_len, NUM_KV_HEADS, HEAD_DIM)
+    value_flat = key_flat + 1000.0
+
+    _call_mgr(
+        mgr,
+        bs=1,
+        q_len=q_len,
+        seq_len=q_len,
+        key_flat=key_flat,
+        value_flat=value_flat,
+        first_step=True,
+        shard_image_size=shard_image_size,
+        gen_timestep_scatter_index=_gen_timestep_index(1, prompt_len),
+    )
+    return key_flat.unsqueeze(0), value_flat.unsqueeze(0), prompt_len
+
+
+def test_compressed_kv_enabled_by_default_without_sp(monkeypatch):
+    monkeypatch.delenv(_COMPRESSED_KV_ENV, raising=False)
+    mgr = _make_cache_mgr(sp_size=1)
+    key, value, _ = _run_first_step(mgr, sp_size=1)
+
+    assert mgr.use_compressed_kv is True
+    assert torch.equal(mgr.attn.last_key, key)
+    assert torch.equal(mgr.attn.last_value, value)
+
+
+@pytest.mark.parametrize("disabled_value", ["0", "false", "no", "off", "disabled", "disable", " FALSE "])
+def test_compressed_kv_can_be_disabled_without_sp(monkeypatch, disabled_value):
+    monkeypatch.setenv(_COMPRESSED_KV_ENV, disabled_value)
+    mgr = _make_cache_mgr(sp_size=1)
+    key, value, _ = _run_first_step(mgr, sp_size=1)
+    repeat_num = NUM_HEADS // NUM_KV_HEADS
+
+    assert mgr.use_compressed_kv is False
+    assert torch.equal(mgr.attn.last_key, key.repeat_interleave(repeat_num, dim=2))
+    assert torch.equal(mgr.attn.last_value, value.repeat_interleave(repeat_num, dim=2))
+
+
+def test_compressed_kv_keeps_image_and_joint_kv_compressed_with_sp(monkeypatch):
+    monkeypatch.delenv(_COMPRESSED_KV_ENV, raising=False)
+    mgr = _make_cache_mgr(sp_size=2)
+    key, value, prompt_len = _run_first_step(mgr, sp_size=2)
+
+    assert torch.equal(mgr.attn.last_key, key[:, prompt_len:])
+    assert torch.equal(mgr.attn.last_value, value[:, prompt_len:])
+    assert torch.equal(mgr.attn.last_attn_metadata.joint_key, key[:, :prompt_len])
+    assert torch.equal(mgr.attn.last_attn_metadata.joint_value, value[:, :prompt_len])

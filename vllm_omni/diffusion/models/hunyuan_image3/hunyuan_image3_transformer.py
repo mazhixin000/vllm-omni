@@ -3,6 +3,7 @@
 
 import inspect
 import logging
+import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -62,7 +63,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
-    get_allgather_parallel_world_size,
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
@@ -84,6 +84,37 @@ from vllm_omni.model_executor.layers.timestep_embedding import timestep_embeddin
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
+
+_HUNYUAN_IMAGE3_COMPRESSED_KV_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_COMPRESSED_KV"
+_DISABLED_OPTIMIZATION_VALUES = frozenset({"0", "false", "no", "off", "disabled", "disable"})
+_compressed_kv_status_logged = False
+
+
+def _is_hunyuan_image3_compressed_kv_enabled() -> bool:
+    """Return whether HunyuanImage3 should keep GQA K/V heads compressed.
+
+    The optimization is enabled by default. Set
+    ``VLLM_OMNI_HUNYUAN_IMAGE3_COMPRESSED_KV=0`` before model initialization
+    to restore the original K/V head expansion.
+    """
+    value = os.environ.get(_HUNYUAN_IMAGE3_COMPRESSED_KV_ENV, "").strip().lower()
+    return value not in _DISABLED_OPTIMIZATION_VALUES
+
+
+def _log_hunyuan_image3_compressed_kv_status(enabled: bool, num_heads: int, num_kv_heads: int) -> None:
+    global _compressed_kv_status_logged
+    if _compressed_kv_status_logged:
+        return
+    logger.info(
+        "HunyuanImage3 compressed K/V optimization is %s: Q heads=%d, K/V heads=%d, repeat_kv=%s; "
+        "set %s=0 to restore K/V expansion.",
+        "enabled" if enabled else "disabled",
+        num_heads,
+        num_kv_heads,
+        "skipped" if enabled else "enabled",
+        _HUNYUAN_IMAGE3_COMPRESSED_KV_ENV,
+    )
+    _compressed_kv_status_logged = True
 
 
 def _is_moe(config: PretrainedConfig) -> bool:
@@ -970,8 +1001,9 @@ class ImageKVCacheManager:
         self._injected_ar_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         self.sp_size = get_sequence_parallel_world_size()
-        self.allgather_size = get_allgather_parallel_world_size()
         self.sp_rank = get_sequence_parallel_rank()
+        self.use_compressed_kv = _is_hunyuan_image3_compressed_kv_enabled()
+        _log_hunyuan_image3_compressed_kv_status(self.use_compressed_kv, self.num_heads, self.num_kv_heads)
         self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -1143,8 +1175,6 @@ class ImageKVCacheManager:
 
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
-        repeat_num = head_num_per_rank // kv_head_num_per_rank
-        keep_kv_compressed = self.allgather_size > 1
         head_dim = query.shape[2]
 
         query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
@@ -1186,7 +1216,8 @@ class ImageKVCacheManager:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
 
-        if not keep_kv_compressed:
+        if not self.use_compressed_kv:
+            repeat_num = head_num_per_rank // kv_head_num_per_rank
             key = repeat_kv(key, repeat_num)
             value = repeat_kv(value, repeat_num)
             if self.sp_size > 1:
