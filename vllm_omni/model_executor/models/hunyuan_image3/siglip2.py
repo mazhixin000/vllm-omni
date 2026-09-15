@@ -50,7 +50,11 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.vision import is_vit_use_data_parallel
+
+try:
+    import torch_npu  # pyright: ignore[reportMissingImports]
+except ImportError:
+    torch_npu = None
 
 
 class Config:
@@ -146,7 +150,8 @@ class Siglip2Attention(nn.Module):
         self.head_dim = self.embed_dim // self.num_heads
         self.scale = self.head_dim**-0.5
 
-        use_data_parallel = is_vit_use_data_parallel()
+        # use_data_parallel = is_vit_use_data_parallel()
+        use_data_parallel = True
         self.qkv_proj = QKVParallelLinear(
             hidden_size=self.embed_dim,
             head_size=self.head_dim,
@@ -186,20 +191,44 @@ class Siglip2Attention(nn.Module):
         seq_length = hidden_states.shape[0]
 
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.chunk(3, dim=-1)
-
-        q = q.view(seq_length, self.num_heads_per_partition, self.head_dim)
-        k = k.view(seq_length, self.num_heads_per_partition, self.head_dim)
-        v = v.view(seq_length, self.num_heads_per_partition, self.head_dim)
-
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-        attn_output = self.attn(
-            query=q.unsqueeze(0),
-            key=k.unsqueeze(0),
-            value=v.unsqueeze(0),
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
+        qkv = (
+            qkv.view(
+                seq_length,
+                3,
+                self.num_heads_per_partition,
+                self.head_dim,
+            )
+            .permute(1, 0, 2, 3)
+            .contiguous()
         )
+        q, k, v = qkv.unbind(0)
+
+        if hidden_states.device.type == "npu" and cu_seqlens.numel() == 2:
+            assert torch_npu is not None
+            attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                q.unsqueeze(0),
+                k.unsqueeze(0),
+                v.unsqueeze(0),
+                num_heads=self.num_heads_per_partition,
+                num_key_value_heads=self.num_heads_per_partition,
+                input_layout="BSND",
+                scale=self.scale,
+                pre_tokens=2147483647,
+                next_tokens=2147483647,
+                sparse_mode=0,
+                inner_precise=0,
+                softmax_lse_flag=False,
+            )
+            attn_output = attn_output.squeeze(0)
+        else:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            attn_output = self.attn(
+                query=q.unsqueeze(0),
+                key=k.unsqueeze(0),
+                value=v.unsqueeze(0),
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
         attn_output = attn_output.reshape(seq_length, self.num_heads_per_partition * self.head_dim)
 
         attn_output, _ = self.out_proj(attn_output)
@@ -214,7 +243,8 @@ class Siglip2MLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        use_data_parallel = is_vit_use_data_parallel()
+        # use_data_parallel = is_vit_use_data_parallel()
+        use_data_parallel = True
         self.activation_fn = get_act_fn(config.hidden_act)
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
@@ -258,7 +288,7 @@ class Siglip2EncoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        self.layer_norm2 = nn.LayerNorm(normalized_shape=self.embed_dim, eps=config.layer_norm_eps)
 
     def forward(
         self,
@@ -273,10 +303,22 @@ class Siglip2EncoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
         hidden_states = self.self_attn(hidden_states, cu_seqlens=cu_seqlens)
-        hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = self.layer_norm2(hidden_states)
+        if hidden_states.device.type == "npu":
+            assert torch_npu is not None
+            hidden_states, _, _, residual = torch_npu.npu_add_layer_norm(
+                residual,
+                hidden_states,
+                self.layer_norm2.weight,
+                self.layer_norm2.bias,
+                self.layer_norm2.eps,
+                True,
+            )
+        else:
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.layer_norm2(hidden_states)
+
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
