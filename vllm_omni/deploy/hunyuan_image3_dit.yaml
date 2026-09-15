@@ -11,6 +11,8 @@ stages:
     gpu_memory_utilization: 0.65
     enforce_eager: true
     devices: "0,1,2,3"
+    additional_config:
+      multistream_overlap_shared_expert: true
     vae_use_slicing: false
     vae_use_tiling: true
     cache_backend:
