@@ -12,6 +12,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
     _STEP_GENERATOR,
+    _STEP_GUIDANCE_RESCALE,
     _STEP_GUIDANCE_SCALE,
     _STEP_INPUT_IDS,
     _STEP_MODEL_KWARGS,
@@ -35,6 +36,8 @@ def _pipeline():
         diffusion_kv_cache_skip_step_indices=None,
     )
     pipeline._pipeline = SimpleNamespace()
+    pipeline.cfg_distilled = False
+    pipeline.use_meanflow = False
     return pipeline
 
 
@@ -52,6 +55,7 @@ def _state(request_id: str, step_index: int) -> StepRequestState:
         _STEP_AR_KV: None,
         _STEP_INPUT_IDS: None,
         _STEP_GUIDANCE_SCALE: 1.0,
+        _STEP_GUIDANCE_RESCALE: 0.0,
         _STEP_MODEL_KWARGS: {
             "num_image_tokens": 17,
             "ar_kv_reuse_len": 0,

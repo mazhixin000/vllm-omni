@@ -943,6 +943,10 @@ def merge_pipeline_deploy(
         if ps.execution_type == StageExecutionType.LLM_AR:
             engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
         extras = _build_extras(ps, ds)
+        final_output_type = ps.final_output_type
+        configured_output_type = str(engine_args.get("output_type", "")).lower()
+        if stage_type == StageType.DIFFUSION and configured_output_type in {"latent", "latents"}:
+            final_output_type = "latents"
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:
             if ds.devices is not None:
@@ -961,7 +965,7 @@ def merge_pipeline_deploy(
                 input_sources=list(ps.input_sources),
                 custom_process_input_func=input_proc,
                 final_output=ps.final_output,
-                final_output_type=ps.final_output_type,
+                final_output_type=final_output_type,
                 worker_type=worker_type,
                 scheduler_cls=ps.scheduler_cls or _scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,

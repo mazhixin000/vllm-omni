@@ -6,6 +6,20 @@ from __future__ import annotations
 from typing import Any
 
 
+HUNYUAN_IMAGE3_EXTRA_BODY_PARAMS = frozenset(
+    {
+        "assistant_prompt",
+        "cond_vae_images",
+        "cond_timesteps",
+        "infer_align_image_size",
+        "return_postprocess_meta",
+        "bot_task",
+        "use_system_prompt",
+        "system_prompt",
+    }
+)
+
+
 def build_x_to_text_prompt(
     model: str,
     prompt: str,

@@ -901,6 +901,8 @@ class HunyuanImage3Processor:
                 _ss = torch.tensor(_ss, dtype=torch.long)
             current_info["vit_spatial_shapes"] = _ss.squeeze(0)
 
+            orig_width, orig_height = image.size
+
             # VAE: per-image bucket via `reso_group.get_target_size`; mirrors
             # HF's `resize_and_crop` (crop_type="center", the official
             # generate_image default with infer_align_image_size=False).
@@ -919,6 +921,7 @@ class HunyuanImage3Processor:
             base_size, ratio_index = self.reso_group.get_base_size_and_ratio_index(image_width, image_height)
             current_info["base_size"] = torch.tensor(base_size)
             current_info["ratio_index"] = torch.tensor(ratio_index)
+            current_info["ori_image_size"] = torch.tensor([orig_width, orig_height], dtype=torch.long)
 
             batch_data.append(current_info)
 
@@ -935,6 +938,7 @@ class HunyuanImage3Processor:
             "vae_pixel_size",
             "base_size",
             "ratio_index",
+            "ori_image_size",
         ]
         for key in same_shape_keys:
             final_image_info[key] = torch.stack([d[key] for d in batch_data], dim=0)
@@ -1076,6 +1080,8 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             config["base_size"] = MultiModalFieldConfig.batched("image")
         if "ratio_index" in hf_inputs:
             config["ratio_index"] = MultiModalFieldConfig.batched("image")
+        if "ori_image_size" in hf_inputs:
+            config["ori_image_size"] = MultiModalFieldConfig.batched("image")
         if "vae_generator_seed" in hf_inputs:
             config["vae_generator_seed"] = MultiModalFieldConfig.batched("image")
         return config
@@ -1731,6 +1737,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # we reconstruct per-image shapes from vae_token_grid_hw below.
         kwargs.pop("vae_pixel_size", None)
         vae_token_grid_hw = kwargs.pop("vae_token_grid_hw", None)
+        ori_image_size = kwargs.pop("ori_image_size", None)
         vae_generator_seed = kwargs.pop("vae_generator_seed", None)
 
         if vit_pixel_values is None or vae_pixel_values is None:
@@ -1771,6 +1778,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 "vit_spatial_shapes": vit_spatial_shapes,
                 "vae_pixel_values": vae_image_list,
                 "vae_token_grid_hw": vae_token_grid_hw,
+                "ori_image_size": ori_image_size,
                 "vae_generator_seed": vae_generator_seed,
             },
         )

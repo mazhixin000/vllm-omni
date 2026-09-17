@@ -849,7 +849,8 @@ class DiffusionEngine:
         prompt: OmniTextPrompt = {"prompt": "dummy run"}
 
         supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
-        if supports_image_input:
+        configured_output_type = str(getattr(self.od_config, "output_type", "")).lower()
+        if supports_image_input and configured_output_type not in {"latent", "latents"}:
             # Provide a dummy image input if the model supports it
             color_format = image_color_format(self.od_config.model_class_name)
             dummy_image = PIL.Image.new(color_format, (width, height))

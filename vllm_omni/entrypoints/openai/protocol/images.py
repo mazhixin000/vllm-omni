@@ -104,6 +104,10 @@ class ImageGenerationRequest(BaseModel):
     system_prompt: str | None = Field(
         default=None, description="Custom system prompt. Used when --use_system_prompt is custom"
     )
+    assistant_prompt: str | list[str] | None = Field(
+        default=None,
+        description="Precomputed HunyuanImage3 assistant/CoT prompt for standalone DiT serving.",
+    )
     use_system_prompt: str | None = Field(
         default=None,
         description="System prompt type. Options: None, dynamic, en_vanilla, "
@@ -139,6 +143,14 @@ class ImageGenerationRequest(BaseModel):
     )
     flow_shift: float | None = Field(
         default=None, description="Scheduler flow_shift (sigma shift) for flow-matching diffusion models."
+    )
+    infer_align_image_size: bool = Field(
+        default=False,
+        description="Align the final HunyuanImage3 output size to a matching condition image's original aspect ratio.",
+    )
+    return_postprocess_meta: bool | None = Field(
+        default=None,
+        description="Return the target size for postprocessing or a separately deployed VAE decoder.",
     )
     extra_params: dict[str, Any] | None = Field(
         default=None,
@@ -176,7 +188,10 @@ class ImageGenerationRequest(BaseModel):
 class ImageData(BaseModel):
     """Single generated image data"""
 
-    b64_json: str | None = Field(default=None, description="Base64-encoded PNG image")
+    b64_json: str | None = Field(
+        default=None,
+        description="Base64-encoded image, or base64(torch.save(tensor)) when output_format is 'pt'.",
+    )
     url: str | None = Field(default=None, description="Image URL (not implemented)")
     revised_prompt: str | None = Field(default=None, description="Revised prompt (OpenAI compatibility, always null)")
 
@@ -196,6 +211,10 @@ class ImageGenerationResponse(BaseModel):
         None,
         description="Chain-of-thought text output from the AR stage. "
         "Only present for image editing (IT2I) with CoT-enabled models.",
+    )
+    postprocess_meta: dict[str, int] | None = Field(
+        None,
+        description="Target image size required by a separately deployed VAE decoder.",
     )
     metrics: dict[str, Any] | None = Field(
         default=None,

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 import json
 import time
 import uuid
@@ -447,10 +448,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
-        stage_configs = getattr(self.engine_client, "stage_configs", ()) or ()
+        stage_source = self._diffusion_engine if self._diffusion_mode else self.engine_client
+        stage_configs = getattr(stage_source, "stage_configs", ()) or ()
         serves_diffusion = self._diffusion_mode or any(
             get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs
         )
+        has_latent_output = any(
+            getattr(stage_config, "final_output_type", None) == "latents" for stage_config in stage_configs
+        )
+        if request.stream and has_latent_output:
+            return self._create_error_response("Latent diffusion output does not support stream=true.", status_code=400)
         normalized_extra_args: dict[str, object] = {}
         diffusion_request_args: dict[str, Any] = {}
         if serves_diffusion:
@@ -458,6 +465,48 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 normalized_extra_args, diffusion_request_args = self._normalize_diffusion_request_args(request)
             except ValueError as exc:
                 return self._create_error_response(str(exc), status_code=400)
+            if has_latent_output and diffusion_request_args.get("num_outputs_per_prompt", 1) not in (None, 1):
+                return self._create_error_response(
+                    "HunyuanImage3 latent output supports only num_outputs_per_prompt=1.", status_code=400
+                )
+            assistant_prompt = normalized_extra_args.get("assistant_prompt")
+            if not (
+                assistant_prompt is None
+                or isinstance(assistant_prompt, str)
+                or (
+                    isinstance(assistant_prompt, list)
+                    and all(isinstance(item, str) for item in assistant_prompt)
+                )
+            ):
+                return self._create_error_response(
+                    "assistant_prompt must be a string or a list of strings.", status_code=400
+                )
+            cond_vae_images = normalized_extra_args.get("cond_vae_images")
+            cond_timesteps = normalized_extra_args.get("cond_timesteps")
+            if (cond_vae_images is None) != (cond_timesteps is None):
+                return self._create_error_response(
+                    "cond_vae_images and cond_timesteps must be provided together.", status_code=400
+                )
+            if cond_vae_images is not None and len(stage_configs) > 1:
+                return self._create_error_response(
+                    "External condition VAE inputs are supported only by a standalone DiT stage.", status_code=400
+                )
+            if cond_vae_images is not None:
+                valid_vae = isinstance(cond_vae_images, list) and (
+                    all(isinstance(item, str) for item in cond_vae_images)
+                    or all(
+                        isinstance(group, list) and all(isinstance(item, str) for item in group)
+                        for group in cond_vae_images
+                    )
+                )
+                valid_timesteps = isinstance(cond_timesteps, list) and all(
+                    isinstance(item, str) for item in cond_timesteps
+                )
+                if not valid_vae or not valid_timesteps:
+                    return self._create_error_response(
+                        "cond_vae_images must be list[str] or list[list[str]], and cond_timesteps must be list[str].",
+                        status_code=400,
+                    )
 
         # Handle diffusion mode
         if self._diffusion_mode:
@@ -2316,6 +2365,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         prompt_token_ids = None
         kv_transfer_params = None
         response_metrics: dict[str, Any] | None = None
+        latent_data_uri: str | None = None
+        response_postprocess_meta: dict[str, int] | None = None
 
         # Build requested modalities set for filtering
         requested_modalities = (
@@ -2328,7 +2379,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 continue
 
             # Filter outputs based on requested modalites
-            if requested_modalities is not None and omni_outputs.final_output_type not in requested_modalities:
+            if (
+                requested_modalities is not None
+                and omni_outputs.final_output_type not in requested_modalities
+                and not (omni_outputs.final_output_type == "latents" and "image" in requested_modalities)
+            ):
                 logger.warning(f"final output type: {omni_outputs.final_output_type} is not needed by the request")
                 continue
 
@@ -2370,6 +2425,35 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     return choices_data
             elif omni_outputs.final_output_type == "image":
                 choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
+                maybe_postprocess_meta = omni_outputs.postprocess_meta
+                if isinstance(maybe_postprocess_meta, dict):
+                    response_postprocess_meta = {
+                        "w": int(maybe_postprocess_meta["w"]),
+                        "h": int(maybe_postprocess_meta["h"]),
+                    }
+            elif omni_outputs.final_output_type == "latents":
+                if request.stream:
+                    return self.create_error_response("Latent diffusion output does not support stream=true.")
+                latent_value = omni_outputs.latents
+                if isinstance(latent_value, list):
+                    if len(latent_value) != 1:
+                        return self.create_error_response("Chat latent output expects exactly one tensor.")
+                    latent_value = latent_value[0]
+                if not isinstance(latent_value, torch.Tensor):
+                    return self.create_error_response("Latent diffusion output is missing its tensor payload.")
+                buffer = io.BytesIO()
+                torch.save(latent_value.detach().cpu(), buffer)
+                latent_data_uri = (
+                    "data:application/x-torch-tensor;base64,"
+                    + base64.b64encode(buffer.getvalue()).decode("ascii")
+                )
+                maybe_postprocess_meta = omni_outputs.postprocess_meta
+                if isinstance(maybe_postprocess_meta, dict):
+                    response_postprocess_meta = {
+                        "w": int(maybe_postprocess_meta["w"]),
+                        "h": int(maybe_postprocess_meta["h"]),
+                    }
+                choices_data = []
             else:
                 logger.warning(f"Unsupported final output type: {omni_outputs.final_output_type}")
                 continue
@@ -2406,6 +2490,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             prompt_text=prompt_text,
             kv_transfer_params=kv_transfer_params,
             metrics=response_metrics,
+            image=latent_data_uri,
+            postprocess_meta=response_postprocess_meta,
         )
 
         # Log complete response if output logging is enabled
@@ -3210,7 +3296,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         output_compression: int = 100,
         size: str = "auto",
         raw_request: Request | None = None,
-    ) -> tuple[list[Image.Image], dict[str, Any], float, str | None] | ErrorResponse | AsyncIterator[str]:
+    ) -> tuple[list[Image.Image], dict[str, Any], float, str | None, dict[str, int] | None] | ErrorResponse | AsyncIterator[str]:
         """Generate diffusion images and return raw images plus generation stats."""
         if request_id is None:
             request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
@@ -3298,6 +3384,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         stage_durations = result.stage_durations
         peak_memory_mb = result.peak_memory_mb
         cot_output = None
+        postprocess_meta = result.postprocess_meta
 
         req_out = getattr(result, "request_output", None)
         if req_out:
@@ -3329,7 +3416,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if isinstance(ar_text, str) and ar_text.strip():
                         cot_output = ar_text
 
-        return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb, cot_output
+        return self._flatten_diffusion_images(images), stage_durations, peak_memory_mb, cot_output, postprocess_meta
 
     async def _stream_diffusion_image_chunks(
         self,
@@ -3671,8 +3758,40 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             multimodal_output = getattr(result, "multimodal_output", {}) or {}
             stage_durations = result.stage_durations
             peak_memory_mb = result.peak_memory_mb
+            latent_data_uri: str | None = None
+            response_postprocess_meta: dict[str, int] | None = None
+            maybe_postprocess_meta = result.postprocess_meta
+            if isinstance(maybe_postprocess_meta, dict):
+                response_postprocess_meta = {
+                    "w": int(maybe_postprocess_meta["w"]),
+                    "h": int(maybe_postprocess_meta["h"]),
+                }
 
-            if final_output_type == "audio":
+            if final_output_type == "latents":
+                latent_result = result.unwrap()
+                latent_value = getattr(latent_result, "latents", None)
+                if isinstance(latent_value, list):
+                    if len(latent_value) != 1:
+                        return self._create_error_response("Chat latent output expects exactly one tensor.")
+                    latent_value = latent_value[0]
+                if not isinstance(latent_value, torch.Tensor):
+                    return self._create_error_response("Latent diffusion output is missing its tensor payload.")
+                buffer = io.BytesIO()
+                torch.save(latent_value.detach().cpu(), buffer)
+                latent_data_uri = (
+                    "data:application/x-torch-tensor;base64,"
+                    + base64.b64encode(buffer.getvalue()).decode("ascii")
+                )
+                maybe_postprocess_meta = result.postprocess_meta
+                if maybe_postprocess_meta is None:
+                    maybe_postprocess_meta = latent_result.postprocess_meta
+                if isinstance(maybe_postprocess_meta, dict):
+                    response_postprocess_meta = {
+                        "w": int(maybe_postprocess_meta["w"]),
+                        "h": int(maybe_postprocess_meta["h"]),
+                    }
+                message = ChatMessage(role="assistant", content="Latent generation completed.")
+            elif final_output_type == "audio":
                 sample_rate = 48000
                 for key in ("audio_sample_rate", "sample_rate", "sampling_rate", "sr"):
                     raw_rate = multimodal_output.get(key)
@@ -3793,6 +3912,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     total_tokens=len(prompt.split()) + 1,
                 ),
                 metrics=self._get_diffusion_extra_output_params(result),
+                image=latent_data_uri,
+                postprocess_meta=response_postprocess_meta,
             )
 
             logger.info(

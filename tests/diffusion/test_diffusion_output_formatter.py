@@ -199,6 +199,57 @@ def test_formatter_maps_trajectory_payload_to_request_output(
     }
 
 
+def test_formatter_maps_final_latents_without_using_trajectory_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    latents = torch.randn(32, 8, 8)
+    metadata = {"image": {"postprocess_meta": {"w": 1024, "h": 768}}}
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {
+            "payload": {"latents": latents},
+            "metadata": metadata,
+        }
+    )
+
+    [result] = format_diffusion_outputs(
+        request=_request("generate an image"),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None),
+        output_data=None,
+        postprocess_output=postprocess_output,
+    )
+
+    assert result.images == []
+    assert result.final_output_type == "latents"
+    assert result.latents is latents
+    assert result.trajectory_latents is None
+    assert result.multimodal_output == {"metadata": metadata}
+    assert result.custom_output == {"postprocess_meta": {"w": 1024, "h": 768}}
+    assert result.postprocess_meta == {"w": 1024, "h": 768}
+
+
+def test_formatter_preserves_flat_legacy_postprocess_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    postprocess_output = normalize_diffusion_postprocess_output(
+        {
+            "payload": {"latents": torch.zeros(1)},
+            "metadata": {"postprocess_meta": {"w": 720, "h": 1280}},
+        }
+    )
+
+    [result] = format_diffusion_outputs(
+        request=_request("legacy"),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None),
+        output_data=None,
+        postprocess_output=postprocess_output,
+    )
+
+    assert result.postprocess_meta == {"w": 720, "h": 1280}
+    assert result.custom_output == {"postprocess_meta": {"w": 720, "h": 1280}}
+
+
 def test_formatter_preserves_text_envelope_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
     postprocess_output = normalize_diffusion_postprocess_output(

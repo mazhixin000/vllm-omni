@@ -1,7 +1,5 @@
-# HunyuanImage-3.0-Instruct DiT-only deploy.
-#
-# Use this for standalone DiT/offline execution. This file resolves to one
-# diffusion stage with stage_id 0 and does not depend on the AR stage.
+# HunyuanImage-3.0-Instruct standalone DiT with disaggregated VAE decode.
+# The service returns model-space latents and does not construct or load the VAE.
 # cfg_distilled/use_meanflow are detected from the checkpoint config. Keep
 # cfg_parallel_size=1 for cfg_distilled checkpoints.
 pipeline: hunyuan_image3_dit
@@ -13,7 +11,7 @@ stages:
     gpu_memory_utilization: 0.9
     enforce_eager: true
     devices: "0,1,2,3"
-    # output_type: latent
+    output_type: latent
     vae_use_slicing: false
     vae_use_tiling: false
     cache_backend:
@@ -43,9 +41,9 @@ platforms:
         gpu_memory_utilization: 0.65
         devices: "0,1,2,3"
         max_num_batched_tokens: 32768
-        # parallel_config:
-        #   tensor_parallel_size: 4
-        #   enable_expert_parallel: true
+        parallel_config:
+          tensor_parallel_size: 4
+          enable_expert_parallel: true
 
   xpu:
     stages:

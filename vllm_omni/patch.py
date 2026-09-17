@@ -484,3 +484,24 @@ def _patch_cumem_free_callback_cuda() -> None:
 
 
 _patch_cumem_free_callback_cuda()
+
+
+# =============================================================================
+# 模型级 monkey-patch 自动加载入口
+# =============================================================================
+# 把可选的、按模型隔离的运行时融合/替换补丁集中到
+# `vllm_omni/diffusion/patches/` 下，本文件只做一次触发式 import。
+#
+# 已注册的 patch：
+#   - hunyuan_image3_fusion : DiT RoPE Q/K / Add+RmsNorm / SwiGLU 融合
+#     开关环境变量：DIT_FUSE_ROPE_QK / DIT_FUSE_ADD_RMSNORM / DIT_FUSE_SWIGLU
+#
+# 加载失败一律 warn 后 fallthrough，不阻断 vllm_omni 主流程。
+def _load_diffusion_model_patches() -> None:
+    try:
+        from vllm_omni.diffusion.patches import hunyuan_image3_fusion  # noqa: F401
+    except Exception as _exc:  # noqa: BLE001
+        _PATCH_LOGGER.warning("hunyuan_image3 fusion patch not loaded: %s", _exc)
+
+
+_load_diffusion_model_patches()

@@ -1,6 +1,7 @@
 # HunyuanImage-3.0-Instruct deploy: AR (stage 0) + DiT (stage 1)
 # with AR-to-DiT KV reuse. The base CUDA layout uses 2 GPUs for AR
-# and 2 GPUs for DiT.
+# and 2 GPUs for DiT. DiT cfg_distilled/use_meanflow behavior is detected
+# from the checkpoint config; cfg_distilled requires cfg_parallel_size=1.
 pipeline: hunyuan_image_3_moe
 async_chunk: false
 trust_remote_code: true

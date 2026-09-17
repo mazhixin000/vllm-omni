@@ -104,7 +104,7 @@ class OmniRequestOutput:
     # Diffusion model fields
     images: list[Image.Image] = field(default_factory=list)
     prompt: OmniPromptType | None = None
-    latents: torch.Tensor | None = None
+    latents: torch.Tensor | list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_log_probs: torch.Tensor | None = None
@@ -184,7 +184,7 @@ class OmniRequestOutput:
         images: list[Image.Image],
         prompt: OmniPromptType | None = None,
         metrics: dict[str, Any] | None = None,
-        latents: torch.Tensor | None = None,
+        latents: torch.Tensor | list[torch.Tensor] | None = None,
         trajectory_latents: torch.Tensor | None = None,
         trajectory_timesteps: torch.Tensor | None = None,
         trajectory_log_probs: torch.Tensor | None = None,
@@ -264,12 +264,26 @@ class OmniRequestOutput:
         """
         if self.request_output is not None:
             if isinstance(self.request_output, OmniRequestOutput):
-                return self.request_output._custom_output
+                return self.request_output.custom_output
         return self._custom_output
 
     @custom_output.setter
     def custom_output(self, value: dict[str, Any]) -> None:
         self._custom_output = value
+
+    @property
+    def postprocess_meta(self) -> Any:
+        """Return image postprocess metadata from canonical or legacy output fields."""
+        multimodal_output = self.multimodal_output
+        if isinstance(multimodal_output, dict):
+            metadata = multimodal_output.get("metadata")
+            if isinstance(metadata, dict):
+                image_metadata = metadata.get("image")
+                if isinstance(image_metadata, dict) and image_metadata.get("postprocess_meta") is not None:
+                    return image_metadata["postprocess_meta"]
+                if metadata.get("postprocess_meta") is not None:
+                    return metadata["postprocess_meta"]
+        return self.custom_output.get("postprocess_meta")
 
     @property
     def num_images(self) -> int:
@@ -331,7 +345,7 @@ class OmniRequestOutput:
     @property
     def is_diffusion_output(self) -> bool:
         """Check if this is a diffusion model output."""
-        return len(self.images) > 0 or self.final_output_type == "image"
+        return len(self.images) > 0 or self.final_output_type in {"image", "latents"}
 
     @property
     def is_pipeline_output(self) -> bool:

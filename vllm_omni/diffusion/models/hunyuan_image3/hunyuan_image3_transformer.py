@@ -3,6 +3,7 @@
 
 import inspect
 import logging
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -648,6 +649,8 @@ class ImageInfo:
         self.w = image_width
         self.image_height = image_height
         self.h = image_height
+        self.ori_image_width = kwargs.get("ori_image_width", image_width)
+        self.ori_image_height = kwargs.get("ori_image_height", image_height)
         self.token_width = token_width
         self.tk_w = token_width
         self.token_height = token_height
@@ -661,6 +664,7 @@ class ImageInfo:
 
         self.add_timestep_token = kwargs.get("add_timestep_token", True)
         self.add_guidance_token = kwargs.get("add_guidance_token", False)
+        self.add_timestep_r_token = kwargs.get("add_timestep_r_token", False)
         self.use_front_boi_token = kwargs.get("use_front_boi_token", True)
         self.add_image_shape_token = kwargs.get("add_image_shape_token", True)
 
@@ -698,6 +702,7 @@ class ImageInfo:
                 token_length=self.image_token_length,
                 add_timestep_token=self.add_timestep_token,
                 add_guidance_token=self.add_guidance_token,
+                add_timestep_r_token=self.add_timestep_r_token,
                 use_front_boi_token=self.use_front_boi_token,
                 add_image_shape_token=self.add_image_shape_token,
                 base_size=self.base_size,
@@ -1361,6 +1366,8 @@ class HunyuanImage3Config(PretrainedConfig):
         vit=None,
         vit_processor=None,
         vit_aligner=None,
+        cfg_distilled=False,
+        use_meanflow=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -1439,6 +1446,8 @@ class HunyuanImage3Config(PretrainedConfig):
         self.patch_size = patch_size
         self.patch_embed_hidden_dim = patch_embed_hidden_dim
         self.image_base_size = image_base_size
+        self.cfg_distilled = cfg_distilled
+        self.use_meanflow = use_meanflow
 
         # token id
         self.eod_token_id = eod_token_id
@@ -1474,7 +1483,12 @@ class HunyuanImage3ImageProcessor:
         )
         self.vision_encoder_processor = Siglip2ImageProcessorFast.from_dict(config.vit_processor)
 
-    def build_image_info(self, image_size):
+    def build_image_info(
+        self,
+        image_size,
+        add_guidance_token: bool | None = None,
+        add_timestep_r_token: bool | None = None,
+    ):
         # parse image size (HxW, H:W, or <img_ratio_i>)
         if isinstance(image_size, str):
             if image_size.startswith("<img_ratio_"):
@@ -1511,8 +1525,59 @@ class HunyuanImage3ImageProcessor:
             token_height=token_height,
             base_size=base_size,
             ratio_index=ratio_idx,
+            add_guidance_token=(
+                bool(getattr(self.config, "cfg_distilled", False))
+                if add_guidance_token is None
+                else add_guidance_token
+            ),
+            add_timestep_r_token=(
+                bool(getattr(self.config, "use_meanflow", False))
+                if add_timestep_r_token is None
+                else add_timestep_r_token
+            ),
         )
         return image_info
+
+    def _get_cond_image_align_size(
+        self,
+        output_ratio_index: int,
+        cond_images: list[JointImageInfo],
+        infer_align_image_size: bool = False,
+    ) -> tuple[int, int] | None:
+        if not infer_align_image_size or not cond_images:
+            return None
+
+        target_area = self.reso_group.base_size**2
+        output_ratio = self.reso_group[output_ratio_index].ratio
+        for cond_image in cond_images:
+            info = cond_image.vae_image_info
+            if output_ratio_index != info.ratio_index:
+                continue
+            width = info.ori_image_width
+            height = info.ori_image_height
+            if not width or not height or abs(height / width - output_ratio) < 0.01:
+                return None
+            scale = math.sqrt(target_area / (width * height))
+            return round(width * scale), round(height * scale)
+        return None
+
+    def compute_postprocess_meta(
+        self,
+        batch_gen_image_info: list[ImageInfo],
+        batch_cond_image_info: list[list[JointImageInfo]] | None,
+        infer_align_image_size: bool = False,
+    ) -> list[dict[str, int]]:
+        cond_batches = batch_cond_image_info or [[] for _ in batch_gen_image_info]
+        metadata = []
+        for gen_info, cond_images in zip(batch_gen_image_info, cond_batches):
+            align_size = self._get_cond_image_align_size(
+                output_ratio_index=gen_info.ratio_index,
+                cond_images=cond_images,
+                infer_align_image_size=infer_align_image_size,
+            )
+            width, height = align_size or (gen_info.image_width, gen_info.image_height)
+            metadata.append({"w": int(width), "h": int(height)})
+        return metadata
 
 
 class HunYuanMLP(nn.Module):
@@ -1907,11 +1972,11 @@ class HunyuanImage3DecoderLayer(nn.Module):
             **kwargs,
         )
         hidden_states = residual + hidden_states
+
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -2523,6 +2588,19 @@ class HunyuanImage3Model(nn.Module):
         )
 
 
+def rescale_noise_cfg(
+    noise_cfg: torch.Tensor,
+    noise_pred_text: torch.Tensor,
+    guidance_rescale: float = 0.0,
+) -> torch.Tensor:
+    """Rescale CFG prediction following section 3.4 of arXiv:2305.08891."""
+    reduce_dims = list(range(1, noise_cfg.ndim))
+    std_text = noise_pred_text.std(dim=reduce_dims, keepdim=True)
+    std_cfg = noise_cfg.std(dim=reduce_dims, keepdim=True)
+    noise_pred_rescaled = noise_cfg * (std_text / std_cfg.clamp_min(torch.finfo(std_cfg.dtype).eps))
+    return guidance_rescale * noise_pred_rescaled + (1.0 - guidance_rescale) * noise_cfg
+
+
 class ClassifierFreeGuidance:
     def __init__(
         self,
@@ -2894,6 +2972,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # Shift image_mask and gen_timestep_scatter_index to match truncated sequence
         model_kwargs["image_mask"] = model_kwargs["image_mask"][:, positive_reuse_len:]
         model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"] - positive_reuse_len
+        for scatter_key in ("guidance_scatter_index", "timestep_r_scatter_index"):
+            scatter_index = model_kwargs.get(scatter_key)
+            if scatter_index is not None:
+                model_kwargs[scatter_key] = scatter_index - positive_reuse_len
         model_kwargs["ar_kv_reuse_offset"] = positive_reuse_len
 
         # cond-image have computed in ar, we may skip it by index in the future.
@@ -2935,8 +3017,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # 2. inject positive kv
         self.model.inject_ar_kv_into_layers(ar_kv_data, positive_reuse_len)
 
-        # 3. negative cfg prefill
-        if self.do_classifier_free_guidance:
+        # 3. negative cfg prefill. Distilled CFG has no unconditional row.
+        if self.do_classifier_free_guidance and not bool(getattr(self.model.config, "cfg_distilled", False)):
             self._maybe_run_negative_cfg_prefill(
                 input_ids=input_ids,
                 model_kwargs=model_kwargs,
@@ -3042,9 +3124,17 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         self._guidance_scale = guidance_scale
         self._guidance_rescale = guidance_rescale
+        cfg_distilled = bool(getattr(self.model.config, "cfg_distilled", False))
+        use_meanflow = bool(getattr(self.model.config, "use_meanflow", False))
+        if cfg_distilled and guidance_rescale > 0.0:
+            raise ValueError("guidance_rescale is not supported by cfg_distilled checkpoints.")
 
-        # Detect CFG parallel configuration (only 2-branch layout is supported)
-        cfg_parallel_ready = self.do_classifier_free_guidance and get_classifier_free_guidance_world_size() == 2
+        # Distilled CFG has a single conditional row and cannot use 2-branch CFG parallelism.
+        cfg_parallel_ready = (
+            not cfg_distilled
+            and self.do_classifier_free_guidance
+            and get_classifier_free_guidance_world_size() == 2
+        )
 
         # Define call parameters
         device = self._execution_device
@@ -3097,7 +3187,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             attention_mask = attention_mask[s]
             self._split_model_kwargs_for_cfg_parallel(model_kwargs, batch_size, cfg_rank)
         else:
-            cfg_factor = 1 + self.do_classifier_free_guidance
+            cfg_factor = 1 if cfg_distilled else 1 + self.do_classifier_free_guidance
             cfg_rank = None
 
         b, _, q_len1, seq_len = attention_mask.shape
@@ -3140,6 +3230,18 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     latent_model_input = torch.cat([latents] * cfg_factor)
 
                 t_expand = t.repeat(latent_model_input.shape[0])
+                timestep_r = None
+                if use_meanflow:
+                    r = timesteps[i + 1] if i + 1 < len(timesteps) else torch.zeros_like(t)
+                    timestep_r = r.repeat(latent_model_input.shape[0])
+                guidance = None
+                if cfg_distilled:
+                    guidance = torch.full(
+                        (latent_model_input.shape[0],),
+                        1000.0 * self._guidance_scale,
+                        device=device,
+                        dtype=torch.bfloat16,
+                    )
 
                 # ---- TeaCache: decide whether to compute or reuse ----
                 should_compute = True
@@ -3164,6 +3266,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                         input_ids,
                         images=latent_model_input,
                         timestep=t_expand,
+                        timestep_r=timestep_r,
+                        guidance=guidance,
                         **model_kwargs,
                     )
 
@@ -3183,9 +3287,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     # CFG parallel: all_gather → all ranks combine locally (no broadcast needed)
                     gathered = cfg_group.all_gather(pred, separate_tensors=True)
                     pred = self.cfg_operator(gathered[0], gathered[1], self.guidance_scale, step=i)
-                elif self.do_classifier_free_guidance:
+                elif self.do_classifier_free_guidance and not cfg_distilled:
                     pred_cond, pred_uncond = pred.chunk(2)
                     pred = self.cfg_operator(pred_cond, pred_uncond, self.guidance_scale, step=i)
+                if self.do_classifier_free_guidance and not cfg_distilled and self.guidance_rescale > 0.0:
+                    pred = rescale_noise_cfg(pred, pred_cond, guidance_rescale=self.guidance_rescale)
 
                 # Scheduler step (all ranks compute locally in CFG parallel)
                 latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
@@ -3217,6 +3323,13 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     progress_bar.update()
 
         set_forward_context_denoise_step_idx(None)
+
+        if str(output_type).lower() in {"latent", "latents"}:
+            if not return_dict:
+                return (latents,)
+            return HunyuanImage3Text2ImagePipelineOutput(samples=latents)
+        if self.vae is None:
+            raise RuntimeError("HunyuanImage3 VAE is unavailable for image output.")
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor

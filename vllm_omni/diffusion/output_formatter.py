@@ -143,6 +143,7 @@ def format_diffusion_outputs(
     # Only the primary payload determines the response type. Some image models
     # include reasoning text in metadata, but their final output is still an image.
     is_text_output = postprocess_output.primary_key == "text"
+    is_latent_output = postprocess_output.primary_key == "latents"
 
     is_audio_output = supports_audio_output(od_config.model_class_name)
     audio_sample_rate = _metadata_audio_sample_rate(postprocess_output.metadata)
@@ -165,6 +166,7 @@ def format_diffusion_outputs(
         metrics=metrics,
         postprocess_output=postprocess_output,
         is_text_output=is_text_output,
+        is_latent_output=is_latent_output,
         is_audio_output=is_audio_output,
         audio_sample_rate=audio_sample_rate,
         finished=diffusion_output.finished,
@@ -270,12 +272,19 @@ def _format_single_prompt_output(
     metrics: dict[str, object],
     postprocess_output: DiffusionPostprocessOutput,
     is_text_output: bool,
+    is_latent_output: bool,
     is_audio_output: bool,
     audio_sample_rate: int | None,
     finished: bool = True,
 ) -> list[OmniRequestOutput]:
     request_id = request.request_id
     mm_output = _build_multimodal_output(postprocess_output, audio_sample_rate)
+    custom_output: dict[str, object] = {}
+    image_metadata = postprocess_output.metadata.get("image")
+    if isinstance(image_metadata, Mapping) and image_metadata.get("postprocess_meta") is not None:
+        custom_output["postprocess_meta"] = image_metadata["postprocess_meta"]
+    elif postprocess_output.metadata.get("postprocess_meta") is not None:
+        custom_output["postprocess_meta"] = postprocess_output.metadata["postprocess_meta"]
     if is_text_output:
         mm_output["text"] = outputs[0] if len(outputs) == 1 else outputs
     trajectory_payload = _trajectory_payload(postprocess_output, diffusion_output)
@@ -292,7 +301,26 @@ def _format_single_prompt_output(
                 prompt=prompt,
                 metrics=metrics,
                 multimodal_output=mm_output,
+                custom_output=custom_output,
                 final_output_type="text",
+                stage_durations=diffusion_output.stage_durations,
+                peak_memory_mb=diffusion_output.peak_memory_mb,
+                finished=finished,
+            ),
+        ]
+
+    if is_latent_output:
+        latent_payload = postprocess_output.outputs.get("latents")
+        return [
+            OmniRequestOutput.from_diffusion(
+                request_id=request_id,
+                images=[],
+                prompt=prompt,
+                metrics=metrics,
+                latents=latent_payload,
+                multimodal_output=mm_output,
+                custom_output=custom_output,
+                final_output_type="latents",
                 stage_durations=diffusion_output.stage_durations,
                 peak_memory_mb=diffusion_output.peak_memory_mb,
                 finished=finished,
@@ -314,6 +342,7 @@ def _format_single_prompt_output(
                 trajectory_timesteps=trajectory_timesteps,
                 trajectory_log_probs=trajectory_log_probs,
                 trajectory_decoded=trajectory_decoded,
+                custom_output=custom_output,
                 multimodal_output=_format_audio_multimodal_output(
                     request_audio_payload,
                     audio_sample_rate,
@@ -338,6 +367,7 @@ def _format_single_prompt_output(
             trajectory_log_probs=trajectory_log_probs,
             trajectory_decoded=trajectory_decoded,
             multimodal_output=mm_output,
+            custom_output=custom_output,
             stage_durations=diffusion_output.stage_durations,
             peak_memory_mb=diffusion_output.peak_memory_mb,
             finished=finished,

@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import base64
 import copy
+import io
 import logging
+import os
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -30,6 +33,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
 
@@ -48,6 +52,7 @@ from .hunyuan_image3_transformer import (
     UNetUp,
     build_batch_2d_rope,
     real_batched_index_select,
+    rescale_noise_cfg,
     retrieve_timesteps,
 )
 from .system_prompt import get_system_prompt
@@ -65,13 +70,117 @@ _STEP_MODEL_KWARGS = "hunyuan_model_kwargs"
 _STEP_INPUT_IDS = "hunyuan_input_ids"
 _STEP_GENERATOR = "hunyuan_generator"
 _STEP_GUIDANCE_SCALE = "hunyuan_guidance_scale"
+_STEP_GUIDANCE_RESCALE = "hunyuan_guidance_rescale"
 _STEP_CFG_FACTOR = "hunyuan_cfg_factor"
 _STEP_OUTPUT_SIZE = "hunyuan_output_size"
+_STEP_POSTPROCESS_META = "hunyuan_postprocess_meta"
+_STEP_RETURN_POSTPROCESS_META = "hunyuan_return_postprocess_meta"
 _STEP_COT_TEXT_LIST = "hunyuan_cot_text_list"
 _STEP_AR_KV = "hunyuan_ar_kv"
 _STEP_PROMPT_KV = "hunyuan_prompt_kv"
 
 _HUNYUAN_DEFAULT_OUTPUT_TYPE = "pil"
+_MAX_SERIALIZED_COND_TENSOR_BYTES = 64 * 1024 * 1024
+
+
+def _set_postprocess_meta(metadata: dict[str, Any], postprocess_meta: Any) -> None:
+    image_metadata = metadata.setdefault("image", {})
+    if not isinstance(image_metadata, dict):
+        raise TypeError("Hunyuan image metadata must be a dictionary.")
+    image_metadata["postprocess_meta"] = postprocess_meta
+
+
+def _should_return_postprocess_meta(extra_args: dict[str, Any]) -> bool:
+    value = extra_args.get("return_postprocess_meta")
+    return True if value is None else bool(value)
+
+
+def _hunyuan_cfg_factor(cfg_distilled: bool, guidance_scale: float) -> int:
+    return 1 if cfg_distilled else 1 + int(guidance_scale > 1.0)
+
+
+def _meanflow_timestep_r(timesteps: torch.Tensor, step_index: int) -> torch.Tensor:
+    """Return MeanFlow interval endpoint r: next timestep, or zero at the final step."""
+    if step_index < 0 or step_index >= len(timesteps):
+        raise IndexError(f"MeanFlow step index {step_index} is outside {len(timesteps)} timesteps.")
+    if step_index + 1 < len(timesteps):
+        return timesteps[step_index + 1]
+    return torch.zeros_like(timesteps[step_index])
+
+
+def _decode_serialized_tensor(encoded: str, field_name: str) -> torch.Tensor:
+    if not isinstance(encoded, str):
+        raise ValueError(f"Every {field_name} entry must be a base64 string.")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise ValueError(f"Invalid base64 tensor in {field_name}: {exc}") from exc
+    if len(raw) > _MAX_SERIALIZED_COND_TENSOR_BYTES:
+        raise ValueError(
+            f"Serialized tensor in {field_name} exceeds {_MAX_SERIALIZED_COND_TENSOR_BYTES} bytes."
+        )
+    try:
+        tensor = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise ValueError(f"Invalid serialized tensor in {field_name}: {exc}") from exc
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError(f"Decoded {field_name} entry is not a tensor.")
+    return tensor
+
+
+def _normalize_external_cond_latent(latent: torch.Tensor) -> torch.Tensor:
+    if latent.ndim == 5 and latent.shape[0] == 1 and latent.shape[2] == 1:
+        latent = latent[0, :, 0]
+    elif latent.ndim == 4 and latent.shape[0] == 1:
+        latent = latent[0]
+    elif latent.ndim == 4 and latent.shape[1] == 1:
+        latent = latent[:, 0]
+    if latent.ndim != 3:
+        raise ValueError(
+            "Each resolved cond_vae_images tensor must have shape [C,H,W], "
+            f"[1,C,H,W], or [1,C,1,H,W], but got {tuple(latent.shape)}."
+        )
+    return latent
+
+
+def _decode_external_conditions(
+    vae_chunks: list[str],
+    timestep_chunks: list[str],
+    expected_num: int,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    try:
+        if not vae_chunks or not timestep_chunks:
+            raise ValueError("cond_vae_images and cond_timesteps cannot be empty.")
+        decoded_vae = [_decode_serialized_tensor(value, "cond_vae_images") for value in vae_chunks]
+        timestep_tensors = [_decode_serialized_tensor(value, "cond_timesteps") for value in timestep_chunks]
+        try:
+            cond_t = torch.cat(timestep_tensors, dim=0)
+        except (RuntimeError, TypeError) as exc:
+            raise ValueError(f"cond_timesteps tensors must be concatenable along dimension 0: {exc}") from exc
+        if cond_t.ndim != 1:
+            raise ValueError(f"Concatenated cond_timesteps must be one-dimensional, got {tuple(cond_t.shape)}.")
+        if len(decoded_vae) == 1 and expected_num > 1:
+            batched_vae = decoded_vae[0]
+            if batched_vae.ndim >= 4 and batched_vae.shape[0] == expected_num:
+                decoded_vae = [batched_vae[index] for index in range(expected_num)]
+        decoded_vae = [_normalize_external_cond_latent(latent) for latent in decoded_vae]
+        if len(decoded_vae) != expected_num:
+            raise ValueError(
+                f"cond_vae_images resolves to {len(decoded_vae)} tensors, "
+                f"but {expected_num} condition images were supplied."
+            )
+        if cond_t.numel() == 1 and expected_num > 1:
+            cond_t = cond_t.repeat(expected_num)
+        if cond_t.numel() != expected_num:
+            raise ValueError(
+                f"cond_timesteps resolves to {cond_t.numel()} values, "
+                f"but {expected_num} condition images were supplied."
+            )
+        return decoded_vae, cond_t.to(dtype=torch.float32)
+    except OmniClientError:
+        raise
+    except (ValueError, TypeError) as exc:
+        raise OmniClientError(str(exc)) from exc
 
 
 def default(val, d):
@@ -171,6 +280,8 @@ def _image_info_to_payload(image_info: ImageInfo) -> dict[str, Any]:
         "image_tensor": image_info.image_tensor,
         "image_width": _to_python_scalar(image_info.image_width),
         "image_height": _to_python_scalar(image_info.image_height),
+        "ori_image_width": _to_python_scalar(image_info.ori_image_width),
+        "ori_image_height": _to_python_scalar(image_info.ori_image_height),
         "token_width": _to_python_scalar(image_info.token_width),
         "token_height": _to_python_scalar(image_info.token_height),
         "image_token_length": _to_python_scalar(image_info.image_token_length),
@@ -178,6 +289,7 @@ def _image_info_to_payload(image_info: ImageInfo) -> dict[str, Any]:
         "ratio_index": _to_python_scalar(image_info.ratio_index),
         "add_timestep_token": image_info.add_timestep_token,
         "add_guidance_token": image_info.add_guidance_token,
+        "add_timestep_r_token": image_info.add_timestep_r_token,
         "use_front_boi_token": image_info.use_front_boi_token,
         "add_image_shape_token": image_info.add_image_shape_token,
     }
@@ -197,6 +309,8 @@ def _image_info_from_payload(payload: dict[str, Any]) -> ImageInfo:
         image_tensor=_to_tensor_if_needed(payload.get("image_tensor")),
         image_width=payload.get("image_width"),
         image_height=payload.get("image_height"),
+        ori_image_width=payload.get("ori_image_width", payload.get("image_width")),
+        ori_image_height=payload.get("ori_image_height", payload.get("image_height")),
         token_width=payload.get("token_width"),
         token_height=payload.get("token_height"),
         image_token_length=payload.get("image_token_length"),
@@ -204,6 +318,7 @@ def _image_info_from_payload(payload: dict[str, Any]) -> ImageInfo:
         ratio_index=payload.get("ratio_index"),
         add_timestep_token=payload.get("add_timestep_token", True),
         add_guidance_token=payload.get("add_guidance_token", False),
+        add_timestep_r_token=payload.get("add_timestep_r_token", False),
         use_front_boi_token=payload.get("use_front_boi_token", True),
         add_image_shape_token=payload.get("add_image_shape_token", True),
     )
@@ -268,6 +383,8 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
             image_tensor=vae_tensor,
             image_width=target_width,
             image_height=target_height,
+            ori_image_width=orig_width,
+            ori_image_height=orig_height,
             token_width=target_width // vae_w_factor,
             token_height=target_height // vae_h_factor,
             base_size=base_size,
@@ -350,11 +467,23 @@ def get_hunyuan_image3_post_process_func(od_config: OmniDiffusionConfig):
             if tensor.dim() == 3:
                 tensor = tensor.unsqueeze(0)
             do_denormalize = [True] * tensor.shape[0]
-            images["payload"]["image"] = image_processor.postprocess(
+            processed = image_processor.postprocess(
                 tensor,
                 output_type=_HUNYUAN_DEFAULT_OUTPUT_TYPE,
                 do_denormalize=do_denormalize,
             )
+            metadata = images.get("metadata") or {}
+            image_metadata = metadata.get("image") if isinstance(metadata, dict) else None
+            postprocess_meta = image_metadata.get("postprocess_meta") if isinstance(image_metadata, dict) else None
+            if isinstance(postprocess_meta, dict):
+                target_size = (int(postprocess_meta["w"]), int(postprocess_meta["h"]))
+                processed = [
+                    image.resize(target_size, resample=PILImage.Resampling.LANCZOS)
+                    if image.size != target_size
+                    else image
+                    for image in processed
+                ]
+            images["payload"]["image"] = processed
             return images
 
         # Legacy raw tensor format
@@ -410,6 +539,8 @@ class HunyuanImage3Pipeline(
         # update diffusion config
         self.generation_config = GenerationConfig.from_pretrained(od_config.model)
         self.od_config = od_config
+        self.output_type = str(getattr(od_config, "output_type", "pil")).lower()
+        self._latent_only = self.output_type in {"latent", "latents"}
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -428,8 +559,11 @@ class HunyuanImage3Pipeline(
             DistributedAutoencoderKLHunyuan,
         )
 
-        self.vae = DistributedAutoencoderKLHunyuan.from_config(self.hf_config.vae)
-        self.vae.use_spatial_tiling = self.od_config.vae_use_tiling
+        if self._latent_only:
+            self.vae = None
+        else:
+            self.vae = DistributedAutoencoderKLHunyuan.from_config(self.hf_config.vae)
+            self.vae.use_spatial_tiling = self.od_config.vae_use_tiling
         self._pipeline = None
         self._tkwrapper = TokenizerWrapper(od_config.model)
         self.image_processor = HunyuanImage3ImageProcessor(self.hf_config)
@@ -437,6 +571,26 @@ class HunyuanImage3Pipeline(
         # self.vision_model = vision_model.vision_model
         self.vision_aligner = LightProjector(self.hf_config.vit_aligner)
         self.timestep_emb = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
+        self.cfg_distilled = bool(getattr(self.hf_config, "cfg_distilled", False))
+        self.use_meanflow = bool(getattr(self.hf_config, "use_meanflow", False))
+        self.guidance_emb = (
+            TimestepEmbedder(hidden_size=self.hf_config.hidden_size) if self.cfg_distilled else None
+        )
+        self.timestep_r_emb = (
+            TimestepEmbedder(hidden_size=self.hf_config.hidden_size) if self.use_meanflow else None
+        )
+        required_special_tokens = []
+        if self.cfg_distilled:
+            required_special_tokens.append("<guidance>")
+        if self.use_meanflow:
+            required_special_tokens.append("<timestep_r>")
+        missing_tokens = [
+            token for token in required_special_tokens if token not in self._tkwrapper.special_token_map
+        ]
+        if missing_tokens:
+            raise ValueError(f"Checkpoint requires missing tokenizer special tokens: {missing_tokens}")
+        if self.cfg_distilled and self.od_config.parallel_config.cfg_parallel_size != 1:
+            raise ValueError("cfg_distilled checkpoints require cfg_parallel_size=1.")
         if self.hf_config.img_proj_type != "unet":
             raise ValueError(f"Unknown img_proj_type: {self.hf_config.img_proj_type}")
 
@@ -459,6 +613,10 @@ class HunyuanImage3Pipeline(
         self.time_embed_2 = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
         self.lm_head = nn.Linear(self.hf_config.hidden_size, self.hf_config.vocab_size, bias=False)
         self.vllm_config = get_current_vllm_config()
+        if self._latent_only:
+            self._PROFILER_TARGETS = [
+                method for method in self._PROFILER_TARGETS if not method.startswith("vae.")
+            ]
         self.post_init()
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler,
@@ -466,6 +624,8 @@ class HunyuanImage3Pipeline(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         skip_prefixes = ["lm_head."] if self.hf_config.tie_word_embeddings else []
+        if self._latent_only:
+            skip_prefixes.append("vae.")
         # List of unexpected keywords in weight names
         non_model_layer_prefixes = [
             "vae",
@@ -474,6 +634,8 @@ class HunyuanImage3Pipeline(
             "lm_head",
             "patch_embed",
             "timestep_emb",
+            "guidance_emb",
+            "timestep_r_emb",
             "model.wte",
             "model.ln_f",
             "time_embed",
@@ -487,16 +649,28 @@ class HunyuanImage3Pipeline(
             if mod:
                 mod.to(device)
 
-        unexpected_keywords = [
-            "guidance_emb",
-            "timestep_r_emb",
-        ]
-        skip_prefixes.extend(unexpected_keywords)
+        if not self.cfg_distilled:
+            skip_prefixes.append("guidance_emb.")
+        if not self.use_meanflow:
+            skip_prefixes.append("timestep_r_emb.")
         loader = AutoWeightsLoader(
             self,
             skip_prefixes=skip_prefixes,
         )
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        for enabled, prefix in (
+            (self.cfg_distilled, "guidance_emb."),
+            (self.use_meanflow, "timestep_r_emb."),
+        ):
+            if not enabled:
+                continue
+            expected = {name for name, _ in self.named_parameters() if name.startswith(prefix)}
+            missing = sorted(expected - loaded)
+            if missing:
+                raise RuntimeError(
+                    f"Checkpoint enables {prefix.removesuffix('.')} but is missing weights: {missing}"
+                )
+        return loaded
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed
@@ -591,6 +765,25 @@ class HunyuanImage3Pipeline(
         cot_text_list = [
             (p.get("extra", {}).get("ar_generated_text") if isinstance(p, dict) else None) or None for p in prompts
         ]
+        assistant_prompt = extra_args.get("assistant_prompt")
+        if isinstance(assistant_prompt, str):
+            assistant_prompts = [assistant_prompt] * len(cot_text_list)
+        elif isinstance(assistant_prompt, list):
+            if len(assistant_prompt) != len(cot_text_list):
+                raise OmniClientError(
+                    "assistant_prompt list length must match the diffusion request batch size."
+                )
+            if not all(isinstance(item, str) for item in assistant_prompt):
+                raise OmniClientError("Every assistant_prompt list entry must be a string.")
+            assistant_prompts = assistant_prompt
+        elif assistant_prompt is None:
+            assistant_prompts = [None] * len(cot_text_list)
+        else:
+            raise OmniClientError("assistant_prompt must be a string or a list of strings.")
+        cot_text_list = [
+            ar_text or assistant_text or None
+            for ar_text, assistant_text in zip(cot_text_list, assistant_prompts)
+        ]
 
         batch_cond_image_info: list[list[JointImageInfo]] | None = None
         if any(not isinstance(p, str) for p in prompts):
@@ -628,8 +821,33 @@ class HunyuanImage3Pipeline(
             [state.prompt] if state.prompt is not None else [],
             getattr(sampling, "extra_args", {}) or {},
             request_id=state.request_id,
-            allow_cond_image=False,
+            allow_cond_image=True,
         )
+
+    @staticmethod
+    def _extract_external_condition_inputs(
+        extra_args: dict[str, Any],
+        batch_cond_image_info: list[list[JointImageInfo]] | None,
+    ) -> tuple[list[list[str]] | None, list[str] | None]:
+        cond_vae_images = extra_args.get("cond_vae_images")
+        cond_timesteps = extra_args.get("cond_timesteps")
+        if (cond_vae_images is None) != (cond_timesteps is None):
+            raise OmniClientError("cond_vae_images and cond_timesteps must be provided together.")
+        if cond_vae_images is None:
+            return None, None
+        if batch_cond_image_info is None or not any(batch_cond_image_info):
+            raise OmniClientError("External condition VAE inputs require real condition image inputs.")
+        if len(batch_cond_image_info) != 1:
+            raise OmniClientError("External condition VAE inputs currently support one diffusion request at a time.")
+        if not isinstance(cond_vae_images, list) or not isinstance(cond_timesteps, list):
+            raise OmniClientError("cond_vae_images and cond_timesteps must be lists.")
+        if cond_vae_images and all(isinstance(item, str) for item in cond_vae_images):
+            cond_vae_images = [cond_vae_images]
+        if len(cond_vae_images) != 1 or not all(isinstance(item, str) for item in cond_vae_images[0]):
+            raise OmniClientError("cond_vae_images must have shape list[list[str]] for standalone DiT requests.")
+        if not all(isinstance(item, str) for item in cond_timesteps):
+            raise OmniClientError("cond_timesteps must have shape list[str].")
+        return cond_vae_images, cond_timesteps
 
     def _snapshot_injected_ar_kv(self) -> list[list[tuple[torch.Tensor, torch.Tensor]] | None] | None:
         snapshot: list[list[tuple[torch.Tensor, torch.Tensor]] | None] = []
@@ -741,8 +959,10 @@ class HunyuanImage3Pipeline(
         prefix_lens: list[int] | None,
     ) -> Any:
         first = values[0]
-        if first is None:
-            return None
+        if any(value is None for value in values):
+            if all(value is None for value in values):
+                return None
+            raise ValueError(f"Cannot batch missing and present Hunyuan model kwarg {key!r} together.")
         if isinstance(first, torch.Tensor):
             rows = [self._row_from_value(value, branch) for value, branch in zip(values, branches)]
             if key == "attention_mask":
@@ -1037,6 +1257,33 @@ class HunyuanImage3Pipeline(
 
         return x
 
+    @staticmethod
+    def _instantiate_scalar_tokens(
+        x: torch.Tensor,
+        values: torch.Tensor,
+        scatter_index: torch.Tensor,
+        embedder: nn.Module | None,
+        field_name: str,
+    ) -> torch.Tensor:
+        if embedder is None:
+            raise RuntimeError(f"{field_name} embedding is unavailable for this checkpoint.")
+        if scatter_index is None:
+            raise ValueError(f"Missing {field_name} scatter index in tokenizer output.")
+        batch_size, _, hidden_size = x.shape
+        values = values.to(device=x.device).reshape(-1)
+        if values.numel() == 1 and batch_size > 1:
+            values = values.repeat(batch_size)
+        if values.numel() != batch_size:
+            raise ValueError(
+                f"{field_name} has {values.numel()} values but the model batch has {batch_size} rows."
+            )
+        src = embedder(values).reshape(batch_size, 1, hidden_size)
+        return x.scatter(
+            dim=1,
+            index=scatter_index.to(x.device).reshape(batch_size, 1, 1).repeat(1, 1, hidden_size),
+            src=src,
+        )
+
     def instantiate_vit_image_tokens(
         self,
         x: torch.Tensor,
@@ -1076,7 +1323,8 @@ class HunyuanImage3Pipeline(
         if first_step:
             image_output = x.masked_select(image_mask.unsqueeze(-1).bool()).reshape(bsz, -1, n_embd)
         else:
-            image_output = x[:, 1:, :]
+            dynamic_token_count = 1 + int(self.cfg_distilled) + int(self.use_meanflow)
+            image_output = x[:, dynamic_token_count:, :]
         timestep_emb = self.time_embed_2(timestep)
         pred = self.final_layer(image_output, timestep_emb, token_h, token_w)
         return pred
@@ -1141,19 +1389,44 @@ class HunyuanImage3Pipeline(
         batch_cond_image_info_list: list[list[JointImageInfo]],
         cfg_factor: int = 1,
         generator=None,
+        batch_external_cond_vae_images: list[list[str]] | None = None,
+        external_cond_timestep_chunks: list[str] | None = None,
     ):
-        # VAE encode one by one, as we assume cond images have different sizes
+        # VAE encode one by one, as we assume cond images have different sizes.
+        # When external latents are provided, real images are still used by the
+        # ViT/mask/RoPE path and only the local VAE encode is bypassed.
         batch_cond_vae_images, batch_cond_t, batch_cond_vit_images = [], [], []
         for batch_idx, cond_image_info_list in enumerate(batch_cond_image_info_list):
             cond_vae_image_list, cond_t_list, cond_vit_image_list = [], [], []
             cond_generator = generator[batch_idx] if isinstance(generator, list) else generator
-            for image_info in cond_image_info_list:
-                cond_t_, cond_vae_image_ = self.vae_encode(
-                    image_info.vae_image_info.image_tensor.to(self.device),
-                    generator=cond_generator,
+            external_latents: list[torch.Tensor] | None = None
+            external_timesteps: torch.Tensor | None = None
+            if batch_external_cond_vae_images is not None:
+                if external_cond_timestep_chunks is None:
+                    raise ValueError("cond_timesteps must accompany cond_vae_images.")
+                external_latents, external_timesteps = _decode_external_conditions(
+                    batch_external_cond_vae_images[batch_idx],
+                    external_cond_timestep_chunks,
+                    len(cond_image_info_list),
                 )
+            elif self.vae is None:
+                raise ValueError(
+                    "This DiT service was started with output_type=latent; image editing requires "
+                    "cond_vae_images and cond_timesteps."
+                )
+
+            for image_idx, image_info in enumerate(cond_image_info_list):
+                if external_latents is None or external_timesteps is None:
+                    cond_t_, cond_vae_image_ = self.vae_encode(
+                        image_info.vae_image_info.image_tensor.to(self.device),
+                        generator=cond_generator,
+                    )
+                    cond_vae_image = cond_vae_image_.squeeze(0)
+                else:
+                    cond_vae_image = external_latents[image_idx].to(device=self.device, dtype=torch.bfloat16)
+                    cond_t_ = external_timesteps[image_idx : image_idx + 1].to(device=self.device)
                 cond_vit_image_list.append(image_info.vision_image_info.image_tensor)
-                cond_vae_image_list.append(cond_vae_image_.squeeze(0))
+                cond_vae_image_list.append(cond_vae_image)
                 cond_t_list.append(cond_t_)
             batch_cond_vae_images.append(cond_vae_image_list)
             batch_cond_t.append(cond_t_list)
@@ -1255,6 +1528,8 @@ class HunyuanImage3Pipeline(
         batch_system_prompt = system_prompt
         batch_gen_image_info = None
         batch_cond_image_info = kwargs.pop("batch_cond_image_info", None)
+        batch_external_cond_vae_images = kwargs.pop("batch_external_cond_vae_images", None)
+        external_cond_timestep_chunks = kwargs.pop("external_cond_timestep_chunks", None)
 
         #   -- 2.1 message_list
         if batch_message_list is not None:
@@ -1305,14 +1580,24 @@ class HunyuanImage3Pipeline(
                 )
                 batch_cond_image_info = [cond if isinstance(cond, list) else [cond] for cond in batch_cond_image_info]
 
+        if mode == "gen_image" and batch_gen_image_info is not None:
+            for image_info in batch_gen_image_info:
+                if image_info is not None:
+                    image_info.add_guidance_token = self.cfg_distilled
+                    image_info.add_timestep_r_token = self.use_meanflow
+
         #   -- 2.3 seed
         generator = kwargs.get("generator", None)
         if generator is None:
             seeds = self.prepare_seed(seed=kwargs.get("seed"), batch_size=batch_size)
             generator = [torch.Generator(self.device).manual_seed(seed) for seed in seeds]
 
-        # 3. apply chat template
-        cfg_factor = {"gen_text": 1, "gen_image": 1 + int(guidance_scale > 1.0)}
+        # 3. apply chat template. Distilled CFG carries guidance in one
+        # conditional row instead of building cond/uncond rows.
+        cfg_factor = {
+            "gen_text": 1,
+            "gen_image": _hunyuan_cfg_factor(self.cfg_distilled, guidance_scale),
+        }
         bot_task = kwargs.pop("bot_task", "auto")
         # If `drop_think` enabled, always drop <think> parts in the context.
         drop_think = kwargs.get("drop_think", self.generation_config.drop_think)
@@ -1344,7 +1629,11 @@ class HunyuanImage3Pipeline(
         has_ar_kv = kwargs.get("ar_kv_data")
         if batch_cond_image_info is not None and len(batch_cond_image_info[0]) > 0 and not has_ar_kv:
             cond_vae_images, cond_timestep, cond_vit_images = self._encode_cond_image(
-                batch_cond_image_info, cfg_factor[mode], generator=generator
+                batch_cond_image_info,
+                cfg_factor[mode],
+                generator=generator,
+                batch_external_cond_vae_images=batch_external_cond_vae_images,
+                external_cond_timestep_chunks=external_cond_timestep_chunks,
             )
             vit_kwargs = {"spatial_shapes": [], "attention_mask": []}
             for cond_image_info in batch_cond_image_info:
@@ -1415,6 +1704,8 @@ class HunyuanImage3Pipeline(
             guidance_scale=guidance_scale,
             image_mask=to_device(output.gen_image_mask, device),
             gen_timestep_scatter_index=output.gen_timestep_scatter_index,
+            guidance_scatter_index=output.guidance_scatter_index,
+            timestep_r_scatter_index=output.timestep_r_scatter_index,
             cond_vae_images=to_device(cond_vae_images, device),
             cond_timestep=to_device(cond_timestep, device),
             cond_vae_image_mask=to_device(output.cond_vae_image_mask, device),
@@ -1499,6 +1790,10 @@ class HunyuanImage3Pipeline(
                 "image_mask": kwargs.get("image_mask"),
                 "timestep": kwargs.get("timestep"),
                 "gen_timestep_scatter_index": kwargs.get("gen_timestep_scatter_index"),
+                "guidance": kwargs.get("guidance"),
+                "guidance_scatter_index": kwargs.get("guidance_scatter_index"),
+                "timestep_r": kwargs.get("timestep_r"),
+                "timestep_r_scatter_index": kwargs.get("timestep_r_scatter_index"),
                 "cond_vae_images": kwargs.get("cond_vae_images"),
                 "cond_timestep": kwargs.get("cond_timestep"),
                 "cond_vae_image_mask": kwargs.get("cond_vae_image_mask"),
@@ -1560,7 +1855,19 @@ class HunyuanImage3Pipeline(
                 timestep_position_ids = index[
                     torch.arange(bsz), model_kwargs["gen_timestep_scatter_index"][:, -1]
                 ].unsqueeze(-1)
-                updated_model_kwargs["position_ids"] = torch.cat([timestep_position_ids, position_ids], dim=1)
+                dynamic_position_ids = [timestep_position_ids]
+                if self.cfg_distilled:
+                    guidance_position_ids = index[
+                        torch.arange(bsz), model_kwargs["guidance_scatter_index"][:, -1]
+                    ].unsqueeze(-1)
+                    dynamic_position_ids.append(guidance_position_ids)
+                if self.use_meanflow:
+                    timestep_r_position_ids = index[
+                        torch.arange(bsz), model_kwargs["timestep_r_scatter_index"][:, -1]
+                    ].unsqueeze(-1)
+                    dynamic_position_ids.append(timestep_r_position_ids)
+                dynamic_position_ids.append(position_ids)
+                updated_model_kwargs["position_ids"] = torch.cat(dynamic_position_ids, dim=1)
 
                 # attention mask
                 mask_list = []
@@ -1588,6 +1895,8 @@ class HunyuanImage3Pipeline(
                 attention_mask = torch.stack(mask_list, dim=0)
                 updated_model_kwargs["attention_mask"] = attention_mask
                 updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
+                updated_model_kwargs["guidance_scatter_index"] = model_kwargs.get("guidance_scatter_index")
+                updated_model_kwargs["timestep_r_scatter_index"] = model_kwargs.get("timestep_r_scatter_index")
 
         else:
             if mode == "gen_text":
@@ -1597,6 +1906,8 @@ class HunyuanImage3Pipeline(
                 updated_model_kwargs["position_ids"] = model_kwargs["position_ids"]
                 updated_model_kwargs["attention_mask"] = model_kwargs["attention_mask"]
                 updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
+                updated_model_kwargs["guidance_scatter_index"] = model_kwargs.get("guidance_scatter_index")
+                updated_model_kwargs["timestep_r_scatter_index"] = model_kwargs.get("timestep_r_scatter_index")
 
         return updated_model_kwargs
 
@@ -1620,8 +1931,10 @@ class HunyuanImage3Pipeline(
                 image_info.image_token_length
                 + (1 if image_info.add_timestep_token else 0)
                 + (1 if image_info.add_guidance_token else 0)
+                + (1 if image_info.add_timestep_r_token else 0)
             )
             kwargs["num_image_tokens"] = num_image_tokens
+
             # 50 and 5.0 hard code
             results = self.pipeline(
                 batch_size=len(batch_gen_image_info),
@@ -1631,10 +1944,13 @@ class HunyuanImage3Pipeline(
                 ],
                 num_inference_steps=kwargs.get("num_inference_steps", 50),
                 guidance_scale=kwargs.get("guidance_scale", 5.0),
+                guidance_rescale=kwargs.get("guidance_rescale", 0.0),
                 generator=generator,
+                output_type=self.output_type,
                 model_kwargs=kwargs,
             )
             samples = results[0]
+
             return samples
 
         else:
@@ -1664,6 +1980,10 @@ class HunyuanImage3Pipeline(
         image_mask: torch.Tensor | None = None,
         timestep: BatchRaggedTensor | None = None,
         gen_timestep_scatter_index: torch.Tensor | None = None,
+        guidance: torch.Tensor | None = None,
+        guidance_scatter_index: torch.Tensor | None = None,
+        timestep_r: torch.Tensor | None = None,
+        timestep_r_scatter_index: torch.Tensor | None = None,
         # for cond image
         cond_vae_images: BatchRaggedImages | None = None,
         cond_timestep: BatchRaggedTensor | None = None,
@@ -1696,6 +2016,16 @@ class HunyuanImage3Pipeline(
             [
                 ("image_mask", image_mask),
             ],
+        )
+        self._check_inputs(
+            mode == "gen_image" and self.cfg_distilled and not uncond_cfg_prefill,
+            "for a cfg_distilled checkpoint",
+            [("guidance", guidance), ("guidance_scatter_index", guidance_scatter_index)],
+        )
+        self._check_inputs(
+            mode == "gen_image" and self.use_meanflow and not uncond_cfg_prefill,
+            "for a MeanFlow checkpoint",
+            [("timestep_r", timestep_r), ("timestep_r_scatter_index", timestep_r_scatter_index)],
         )
         self._check_inputs(
             cond_vae_images is not None,
@@ -1739,11 +2069,32 @@ class HunyuanImage3Pipeline(
                     inputs_embeds, images, timestep, image_mask
                 )
                 inputs_embeds = self.instantiate_timestep_tokens(inputs_embeds, timestep, gen_timestep_scatter_index)
+                if self.cfg_distilled:
+                    inputs_embeds = self._instantiate_scalar_tokens(
+                        inputs_embeds,
+                        guidance,
+                        guidance_scatter_index,
+                        self.guidance_emb,
+                        "guidance",
+                    )
+                if self.use_meanflow:
+                    inputs_embeds = self._instantiate_scalar_tokens(
+                        inputs_embeds,
+                        timestep_r,
+                        timestep_r_scatter_index,
+                        self.timestep_r_emb,
+                        "timestep_r",
+                    )
             else:
                 t_emb = self.time_embed(timestep)
                 image_emb, token_h, token_w = self.patch_embed(images, t_emb)
-                timestep_emb = self.timestep_emb(timestep).reshape(bsz, -1, n_embd)
-                inputs_embeds = torch.cat([timestep_emb, image_emb], dim=1)
+                dynamic_embeds = [self.timestep_emb(timestep).reshape(bsz, 1, n_embd)]
+                if self.cfg_distilled:
+                    dynamic_embeds.append(self.guidance_emb(guidance.reshape(-1)).reshape(bsz, 1, n_embd))
+                if self.use_meanflow:
+                    dynamic_embeds.append(self.timestep_r_emb(timestep_r.reshape(-1)).reshape(bsz, 1, n_embd))
+                dynamic_embeds.append(image_emb)
+                inputs_embeds = torch.cat(dynamic_embeds, dim=1)
 
         # Instantiate placeholder tokens: <timestep>, <img> for cond images
         # Should only run once with kv-cache enabled.
@@ -1894,17 +2245,28 @@ class HunyuanImage3Pipeline(
             if any(text is not None for text in cot_text_list)
             else None
         )
+        extra_args = getattr(sampling, "extra_args", {}) or {}
+        infer_align_image_size = bool(extra_args.get("infer_align_image_size", False))
+        return_postprocess_meta = _should_return_postprocess_meta(extra_args)
+        batch_external_cond_vae_images, external_cond_timestep_chunks = self._extract_external_condition_inputs(
+            extra_args,
+            batch_cond_image_info,
+        )
 
         height = sampling.height or 1024
         width = sampling.width or 1024
         image_size = (height, width)
         num_inference_steps = sampling.num_inference_steps or 50
         guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 5.0
-        if guidance_scale <= 1.0:
+        if guidance_scale <= 1.0 and not self.cfg_distilled:
             logger.info("HunyuanImage3.0 step execution runs without classifier-free guidance.")
+        guidance_rescale = getattr(sampling, "guidance_rescale", 0.0)
+        if self.cfg_distilled and guidance_rescale > 0.0:
+            raise ValueError("guidance_rescale is not supported by cfg_distilled checkpoints.")
         pipe._guidance_scale = guidance_scale
-        pipe._guidance_rescale = getattr(sampling, "guidance_rescale", 0.0)
+        pipe._guidance_rescale = guidance_rescale
 
+        ar_kv_kwargs = self._extract_ar_kv_from_sampling(sampling)
         model_kwargs = self.prepare_model_inputs(
             prompt=prompt,
             cot_text=cot_text,
@@ -1915,9 +2277,12 @@ class HunyuanImage3Pipeline(
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             batch_cond_image_info=batch_cond_image_info,
+            batch_external_cond_vae_images=batch_external_cond_vae_images,
+            external_cond_timestep_chunks=external_cond_timestep_chunks,
             bot_task=tokenizer_bot_task,
+            **ar_kv_kwargs,
         )
-        model_kwargs.update(self._extract_ar_kv_from_sampling(sampling))
+        model_kwargs.update(ar_kv_kwargs)
         model_kwargs["use_cache"] = False
 
         input_ids = model_kwargs.pop("input_ids")
@@ -1925,10 +2290,16 @@ class HunyuanImage3Pipeline(
         image_info = batch_gen_image_info[0]
         target_height = int(_to_python_scalar(image_info.image_height))
         target_width = int(_to_python_scalar(image_info.image_width))
+        postprocess_meta = self.image_processor.compute_postprocess_meta(
+            batch_gen_image_info=batch_gen_image_info,
+            batch_cond_image_info=batch_cond_image_info,
+            infer_align_image_size=infer_align_image_size,
+        )[0]
         num_image_tokens = (
             image_info.image_token_length
             + (1 if image_info.add_timestep_token else 0)
             + (1 if image_info.add_guidance_token else 0)
+            + (1 if image_info.add_timestep_r_token else 0)
         )
         model_kwargs["num_image_tokens"] = num_image_tokens
 
@@ -1964,7 +2335,7 @@ class HunyuanImage3Pipeline(
         model_kwargs["attention_mask"] = attention_mask.to(latents.device)
 
         pipe._guidance_scale = guidance_scale
-        pipe._guidance_rescale = 0.0
+        pipe._guidance_rescale = guidance_rescale
         input_ids, ar_kv_reuse_len = pipe._maybe_handle_ar_kv_reuse(
             input_ids,
             model_kwargs,
@@ -1979,14 +2350,18 @@ class HunyuanImage3Pipeline(
         state.timesteps = timesteps
         state.step_index = 0
         state.scheduler = req_scheduler
-        state.do_true_cfg = guidance_scale > 1.0
+        state.do_true_cfg = guidance_scale > 1.0 and not self.cfg_distilled
+        cfg_factor = _hunyuan_cfg_factor(self.cfg_distilled, guidance_scale)
         state.extra = {
             _STEP_MODEL_KWARGS: model_kwargs,
             _STEP_INPUT_IDS: input_ids,
             _STEP_GENERATOR: model_kwargs["generator"],
             _STEP_GUIDANCE_SCALE: guidance_scale,
-            _STEP_CFG_FACTOR: 1 + int(guidance_scale > 1.0),
+            _STEP_GUIDANCE_RESCALE: guidance_rescale,
+            _STEP_CFG_FACTOR: cfg_factor,
             _STEP_OUTPUT_SIZE: (target_height, target_width),
+            _STEP_POSTPROCESS_META: postprocess_meta,
+            _STEP_RETURN_POSTPROCESS_META: return_postprocess_meta,
             _STEP_COT_TEXT_LIST: cot_text_list,
             _STEP_AR_KV: self._snapshot_injected_ar_kv(),
         }
@@ -2000,6 +2375,21 @@ class HunyuanImage3Pipeline(
         if state.latents is None:
             raise ValueError(f"Missing Hunyuan latents for request {state.request_id}.")
         model_kwargs = state.extra[_STEP_MODEL_KWARGS]
+        cond_vae = model_kwargs.get("cond_vae_images")
+        if cond_vae is None:
+            cond_signature: tuple[Any, ...] = (None,)
+        elif isinstance(cond_vae, torch.Tensor):
+            cond_signature = ("tensor", tuple(cond_vae.shape[1:]))
+        elif isinstance(cond_vae, list):
+            cond_signature = (
+                "list",
+                tuple(
+                    tuple(item.shape) if isinstance(item, torch.Tensor) else type(item).__name__
+                    for item in cond_vae
+                ),
+            )
+        else:
+            cond_signature = (type(cond_vae).__name__,)
         return (
             state.step_index == 0,
             state.extra[_STEP_CFG_FACTOR],
@@ -2007,6 +2397,7 @@ class HunyuanImage3Pipeline(
             model_kwargs.get("num_image_tokens"),
             model_kwargs.get("ar_kv_reuse_len", 0),
             state.extra.get(_STEP_AR_KV) is not None,
+            cond_signature,
         )
 
     def _ensure_grouped_attention_backend_supported(self, num_states: int) -> None:
@@ -2144,6 +2535,23 @@ class HunyuanImage3Pipeline(
             ],
             dim=0,
         )
+        timestep_r = None
+        if self.use_meanflow:
+            timestep_r = torch.cat(
+                [
+                    _meanflow_timestep_r(state.timesteps, state.step_index).reshape(1).to(device=latents.device)
+                    for _ in range(cfg_factor)
+                    for state in states
+                ],
+                dim=0,
+            )
+        guidance = None
+        if self.cfg_distilled:
+            guidance = torch.tensor(
+                [1000.0 * state.extra[_STEP_GUIDANCE_SCALE] for state in states],
+                device=latents.device,
+                dtype=torch.bfloat16,
+            )
 
         input_ids, model_kwargs = self._merge_step_model_inputs(
             states,
@@ -2160,6 +2568,8 @@ class HunyuanImage3Pipeline(
             input_ids,
             images=latent_model_input,
             timestep=timestep,
+            timestep_r=timestep_r,
+            guidance=guidance,
             **model_kwargs,
         )
 
@@ -2180,13 +2590,22 @@ class HunyuanImage3Pipeline(
             pred_cond, pred_uncond = pred.chunk(2)
             pred = torch.cat(
                 [
-                    self.pipeline.cfg_operator(
+                    rescale_noise_cfg(
+                        guided,
                         pred_cond[state_idx : state_idx + 1],
-                        pred_uncond[state_idx : state_idx + 1],
-                        state.extra[_STEP_GUIDANCE_SCALE],
-                        step=state.step_index,
+                        guidance_rescale=state.extra.get(_STEP_GUIDANCE_RESCALE, 0.0),
                     )
+                    if state.extra.get(_STEP_GUIDANCE_RESCALE, 0.0) > 0.0
+                    else guided
                     for state_idx, state in enumerate(states)
+                    for guided in [
+                        self.pipeline.cfg_operator(
+                            pred_cond[state_idx : state_idx + 1],
+                            pred_uncond[state_idx : state_idx + 1],
+                            state.extra[_STEP_GUIDANCE_SCALE],
+                            step=state.step_index,
+                        )
+                    ]
                 ],
                 dim=0,
             )
@@ -2240,14 +2659,29 @@ class HunyuanImage3Pipeline(
         state: "StepRequestState",
         **kwargs: Any,
     ) -> DiffusionOutput:
-        output_type = kwargs.get("output_type", "pil")
+        output_type = str(kwargs.get("output_type", self.output_type)).lower()
         generator = state.extra.get(_STEP_GENERATOR)
         latents = state.latents
-        if output_type == "latent":
+        cot_text_list = state.extra.get(_STEP_COT_TEXT_LIST) or []
+        metadata: dict[str, Any] = {}
+        if any(text is not None for text in cot_text_list):
+            metadata["text"] = {"ar_generated_text": cot_text_list[0]}
+        return_postprocess_meta = state.extra.get(
+            _STEP_RETURN_POSTPROCESS_META, output_type in {"latent", "latents"}
+        )
+        if return_postprocess_meta:
+            postprocess_meta = state.extra[_STEP_POSTPROCESS_META]
+            _set_postprocess_meta(metadata, postprocess_meta)
+        if output_type in {"latent", "latents"}:
             return DiffusionOutput(
-                output=latents,
+                output={
+                    "payload": {"latents": latents[0]},
+                    "metadata": metadata,
+                },
                 stage_durations=getattr(self, "stage_durations", None),
             )
+        if self.vae is None:
+            raise RuntimeError("HunyuanImage3 VAE is unavailable for image output.")
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor
@@ -2263,10 +2697,6 @@ class HunyuanImage3Pipeline(
             image = image.squeeze(2)
         # Postprocess deferred to engine post_process_func for overlap with next request.
 
-        cot_text_list = state.extra.get(_STEP_COT_TEXT_LIST) or []
-        metadata = {}
-        if any(text is not None for text in cot_text_list):
-            metadata["text"] = {"ar_generated_text": cot_text_list[0]}
         return DiffusionOutput(
             output={
                 "payload": {"image": image[0]},
@@ -2304,8 +2734,14 @@ class HunyuanImage3Pipeline(
         cot_text = (
             [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
         )
+        batch_external_cond_vae_images, external_cond_timestep_chunks = self._extract_external_condition_inputs(
+            extra_args,
+            batch_cond_image_info,
+        )
 
         generator = req.sampling_params.generator or generator
+        infer_align_image_size = bool(extra_args.get("infer_align_image_size", False))
+        return_postprocess_meta = _should_return_postprocess_meta(extra_args)
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
@@ -2328,6 +2764,8 @@ class HunyuanImage3Pipeline(
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             batch_cond_image_info=batch_cond_image_info,
+            batch_external_cond_vae_images=batch_external_cond_vae_images,
+            external_cond_timestep_chunks=external_cond_timestep_chunks,
             bot_task=tokenizer_bot_task,
             **ar_kv_kwargs,
         )
@@ -2335,14 +2773,34 @@ class HunyuanImage3Pipeline(
         model_inputs.update(ar_kv_kwargs)
 
         outputs = self._generate(**model_inputs, **kwargs)
-        image = outputs[0]
+        result = outputs[0]
+
         metadata = {}
         if any(t is not None for t in cot_text_list):
             metadata["text"] = {"ar_generated_text": cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list}
+        postprocess_meta = self.image_processor.compute_postprocess_meta(
+            batch_gen_image_info=model_inputs["batch_gen_image_info"],
+            batch_cond_image_info=batch_cond_image_info,
+            infer_align_image_size=infer_align_image_size,
+        )
+        if return_postprocess_meta:
+            _set_postprocess_meta(
+                metadata,
+                postprocess_meta[0] if len(postprocess_meta) == 1 else postprocess_meta,
+            )
+        if not self._latent_only and infer_align_image_size and isinstance(result, list):
+            for index, target in enumerate(postprocess_meta):
+                target_size = (target["w"], target["h"])
+                if isinstance(result[index], PILImage.Image) and result[index].size != target_size:
+                    result[index] = result[index].resize(target_size, resample=PILImage.Resampling.LANCZOS)
+        if self._latent_only:
+            payload = {"latents": result}
+        else:
+            payload = {"image": result}
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
         return DiffusionOutput(
             output={
-                "payload": {"image": image},
+                "payload": payload,
                 "metadata": metadata,
             },
             stage_durations=stage_durations,

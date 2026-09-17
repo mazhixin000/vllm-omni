@@ -10,3 +10,5 @@ class OmniChatCompletionStreamResponse(ChatCompletionStreamResponse):
 
 class OmniChatCompletionResponse(ChatCompletionResponse):
     metrics: dict[str, Any] | None = None
+    image: str | None = None
+    postprocess_meta: dict[str, int] | None = None

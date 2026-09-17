@@ -23,6 +23,7 @@ from typing import Annotated, Any, Literal, cast
 
 import httpx
 import numpy as np
+import torch
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -1731,12 +1732,39 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
 # Image generation API endpoints
 
 
+def _encode_torch_tensor_base64(tensor: torch.Tensor) -> str:
+    buffer = io.BytesIO()
+    torch.save(tensor.detach().cpu(), buffer)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _extract_latent_response(result: Any) -> tuple[list[torch.Tensor], dict[str, int] | None]:
+    latent_result = result.unwrap() if hasattr(result, "unwrap") else result
+    latents = getattr(result, "latents", None)
+    if latents is None:
+        latents = getattr(latent_result, "latents", None)
+    if latents is None:
+        return [], None
+    latent_list = latents if isinstance(latents, list) else [latents]
+    if not all(isinstance(latent, torch.Tensor) for latent in latent_list):
+        raise ValueError("Latent diffusion output contains a non-tensor payload.")
+    postprocess_meta = getattr(result, "postprocess_meta", None)
+    if postprocess_meta is None:
+        postprocess_meta = getattr(latent_result, "postprocess_meta", None)
+    if isinstance(postprocess_meta, dict):
+        postprocess_meta = {"w": int(postprocess_meta["w"]), "h": int(postprocess_meta["h"])}
+    else:
+        postprocess_meta = None
+    return latent_list, postprocess_meta
+
+
 def _build_image_generation_response(
     *,
     images: list[Image.Image],
     request: ImageGenerationRequest,
     stage_durations: Any,
     peak_memory_mb: Any,
+    postprocess_meta: dict[str, int] | None = None,
 ) -> ImageGenerationResponse | StreamingResponse:
     """Encode generated images and apply the requested response format."""
     output_format = _choose_output_format(request.output_format or "png", None)
@@ -1751,6 +1779,7 @@ def _build_image_generation_response(
         "created": int(time.time()),
         "data": image_data,
         "output_format": output_format,
+        "postprocess_meta": postprocess_meta,
         "metrics": {
             "stage_durations": stage_durations or None,
             "peak_memory_mb": float(peak_memory_mb) if peak_memory_mb else None,
@@ -1803,6 +1832,17 @@ async def generate_images(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=(f"Model mismatch: request specifies '{request.model}' but server is running '{model_name}'."),
         )
+    if any(stage.final_output_type == "latents" for stage in stage_configs):
+        if request.n != 1:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="HunyuanImage3 latent output supports only n=1.",
+            )
+        if request.response_format == ResponseFormat.FILE:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="HunyuanImage3 latent output supports only response_format=b64_json.",
+            )
 
     try:
         # Unify request construction for any multi-stage pipeline to avoid
@@ -1837,6 +1877,10 @@ async def generate_images(
                 extra_body["true_cfg_scale"] = request.true_cfg_scale
             if request.flow_shift is not None:
                 extra_body["flow_shift"] = request.flow_shift
+            if request.infer_align_image_size:
+                extra_body["infer_align_image_size"] = True
+            if request.return_postprocess_meta is not None:
+                extra_body["return_postprocess_meta"] = request.return_postprocess_meta
             if request.extra_params is not None:
                 extra_body["extra_params"] = request.extra_params
             if request.generator_device is not None:
@@ -1864,12 +1908,13 @@ async def generate_images(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     content=generation_result.model_dump(),
                 )
-            flat_images, stage_durations, peak_memory_mb, _ = generation_result
+            flat_images, stage_durations, peak_memory_mb, _, postprocess_meta = generation_result
             return _build_image_generation_response(
                 images=flat_images,
                 request=request,
                 stage_durations=stage_durations,
                 peak_memory_mb=peak_memory_mb,
+                postprocess_meta=postprocess_meta,
             )
 
         # Build params - pass through user values directly
@@ -1884,8 +1929,14 @@ async def generate_images(
             extra_args["system_prompt"] = request.system_prompt
         if request.bot_task is not None:
             extra_args["bot_task"] = request.bot_task
+        if request.assistant_prompt is not None:
+            extra_args["assistant_prompt"] = request.assistant_prompt
         if request.flow_shift is not None:
             extra_args["flow_shift"] = request.flow_shift
+        if request.infer_align_image_size:
+            extra_args["infer_align_image_size"] = True
+        if request.return_postprocess_meta is not None:
+            extra_args["return_postprocess_meta"] = request.return_postprocess_meta
         if extra_args:
             gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
@@ -1920,6 +1971,10 @@ async def generate_images(
         # 3.3 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", request.num_inference_steps)
         _update_if_not_none(gen_params, "guidance_scale", request.guidance_scale)
+        # Pipeline 侧 `if req.sampling_params.guidance_scale_provided` 才会用请求里的
+        # guidance_scale，否则沿用 pipeline 默认；这里保持与 offline runner 一致的语义。
+        if request.guidance_scale is not None:
+            gen_params.guidance_scale_provided = True
         _update_if_not_none(gen_params, "true_cfg_scale", request.true_cfg_scale)
         # If seed is not provided, generate a random one to ensure
         # a proper generator is initialized in the backend.
@@ -1950,6 +2005,26 @@ async def generate_images(
             raise HTTPException(
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
                 detail="No output generated from multi-stage pipeline.",
+            )
+
+        latents, postprocess_meta = _extract_latent_response(result)
+        if latents:
+            if request.n != 1:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="HunyuanImage3 latent output supports only n=1.",
+                )
+            if request.response_format == ResponseFormat.FILE:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="HunyuanImage3 latent output supports only response_format=b64_json.",
+                )
+            return ImageGenerationResponse(
+                created=int(time.time()),
+                data=[ImageData(b64_json=_encode_torch_tensor_base64(latent)) for latent in latents],
+                output_format="pt",
+                size=size_str,
+                postprocess_meta=postprocess_meta,
             )
 
         # Extract images from result
@@ -2029,6 +2104,11 @@ async def edit_images(
     bot_task: str | None = Form(None),
     sys_type: str | None = Form(None),
     system_prompt: str | None = Form(None),
+    assistant_prompt: str | None = Form(None),
+    cond_vae_images: str | None = Form(None),
+    cond_timesteps: str | None = Form(None),
+    infer_align_image_size: bool = Form(False),
+    return_postprocess_meta: bool | None = Form(None),
     return_stage_metrics: bool | None = Form(None),
 ) -> ImageGenerationResponse:
     """
@@ -2055,9 +2135,15 @@ async def edit_images(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="stream=true is only supported for multi-stage image editing pipelines.",
         )
+    if any(stage.final_output_type == "latents" for stage in stage_configs) and n != 1:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="HunyuanImage3 latent output supports only n=1.",
+        )
     try:
         # 2. Build prompt & images params
         cot_output = None
+        postprocess_meta = None
         prompt: OmniTextPrompt = {"prompt": prompt, "modalities": ["image"]}
         if negative_prompt is not None:
             prompt["negative_prompt"] = negative_prompt
@@ -2074,6 +2160,7 @@ async def edit_images(
         # any inputs. This keeps over-limit URL requests from burning network,
         # CPU, and memory on work that will be rejected anyway.
         max_input_images = _get_max_edit_input_images(raw_request, engine_client)
+        max_input_images = 3
         if max_input_images is not None and len(input_images_list) > max_input_images:
             detail = (
                 "Received multiple input images. Only a single image is supported by this model."
@@ -2181,6 +2268,10 @@ async def edit_images(
         # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
         _update_if_not_none(gen_params, "guidance_scale", guidance_scale)
+        # 与 /v1/images/generations 保持一致：显式标记 provided，避免 pipeline 走
+        # `guidance_scale <= 1.0` 默认分支忽略用户传入的值。
+        if guidance_scale is not None:
+            gen_params.guidance_scale_provided = True
         _update_if_not_none(gen_params, "guidance_scale_2", guidance_scale_2)
         _update_if_not_none(gen_params, "strength", strength)
         _update_if_not_none(gen_params, "true_cfg_scale", true_cfg_scale)
@@ -2194,10 +2285,27 @@ async def edit_images(
         _update_if_not_none(gen_params, "resolution", resolution)
 
         extra_args = dict(getattr(gen_params, "extra_args", {}) or {})
+        parsed_cond_vae_images = _parse_hunyuan_tensor_form(cond_vae_images, "cond_vae_images")
+        parsed_cond_timesteps = _parse_hunyuan_tensor_form(cond_timesteps, "cond_timesteps")
+        if (parsed_cond_vae_images is None) != (parsed_cond_timesteps is None):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="cond_vae_images and cond_timesteps must be provided together.",
+            )
+        if parsed_cond_vae_images is not None and len(stage_configs) > 1:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="External condition VAE inputs are supported only by a standalone DiT stage.",
+            )
         edit_extra_args = _build_hunyuan_edit_extra_args(
             bot_task=bot_task,
             sys_type=sys_type,
             system_prompt=system_prompt,
+            assistant_prompt=assistant_prompt,
+            cond_vae_images=parsed_cond_vae_images,
+            cond_timesteps=parsed_cond_timesteps,
+            infer_align_image_size=infer_align_image_size,
+            return_postprocess_meta=return_postprocess_meta,
         )
         extra_args.update(edit_extra_args)
         if extra_args:
@@ -2268,6 +2376,10 @@ async def edit_images(
                 extra_body["sys_type"] = sys_type
             if system_prompt is not None:
                 extra_body["system_prompt"] = system_prompt
+            if infer_align_image_size:
+                extra_body["infer_align_image_size"] = True
+            if return_postprocess_meta is not None:
+                extra_body["return_postprocess_meta"] = return_postprocess_meta
             if return_stage_metrics is not None:
                 extra_body["return_stage_metrics"] = return_stage_metrics
 
@@ -2295,9 +2407,14 @@ async def edit_images(
                     status_code=generation_result.error.code if generation_result.error else 400,
                     detail=generation_result.message,
                 )
-            images, _, _, cot_output = generation_result
+            images, _, _, cot_output, postprocess_meta = generation_result
         else:
             # Single-stage diffusion: use the direct path.
+            if stream and stage_configs[0].final_output_type == "latents":
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="Latent diffusion output does not support stream=true.",
+                )
             result = await _generate_with_async_omni(
                 engine_client=engine_client,
                 gen_params=gen_params,
@@ -2305,6 +2422,16 @@ async def edit_images(
                 prompt=prompt,
                 request_id=request_id,
             )
+            latents, postprocess_meta = _extract_latent_response(result)
+            if latents:
+                return ImageGenerationResponse(
+                    created=int(time.time()),
+                    data=[ImageData(b64_json=_encode_torch_tensor_base64(latent)) for latent in latents],
+                    output_format="pt",
+                    size=size_str,
+                    cot_output=cot_output,
+                    postprocess_meta=postprocess_meta,
+                )
             images = _extract_images_from_result(result)
 
         logger.debug(f"Successfully generated {len(images)} image(s)")
@@ -2326,6 +2453,7 @@ async def edit_images(
             output_format=output_format,
             size=size_str,
             cot_output=cot_output,
+            postprocess_meta=postprocess_meta,
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:
@@ -2508,11 +2636,46 @@ def _check_max_generated_image_size(
             )
 
 
+def _parse_hunyuan_tensor_form(value: str | None, field_name: str) -> list[Any] | None:
+    if value is None:
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"{field_name} must be a JSON-encoded list: {exc.msg}.",
+        ) from exc
+    if not isinstance(parsed, list):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"{field_name} must be a JSON-encoded list.",
+        )
+    if field_name == "cond_vae_images":
+        valid = all(isinstance(item, str) for item in parsed) or all(
+            isinstance(group, list) and all(isinstance(item, str) for item in group) for group in parsed
+        )
+    else:
+        valid = all(isinstance(item, str) for item in parsed)
+    if not valid:
+        expected = "list[str] or list[list[str]]" if field_name == "cond_vae_images" else "list[str]"
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"{field_name} must be a JSON-encoded {expected}.",
+        )
+    return parsed
+
+
 def _build_hunyuan_edit_extra_args(
     *,
     bot_task: str | None,
     sys_type: str | None,
     system_prompt: str | None,
+    assistant_prompt: str | None = None,
+    cond_vae_images: list[Any] | None = None,
+    cond_timesteps: list[Any] | None = None,
+    infer_align_image_size: bool = False,
+    return_postprocess_meta: bool | None = None,
 ) -> dict[str, Any]:
     """Map Hunyuan /v1/images/edits form fields to DiT ``extra_args``."""
     extra_args: dict[str, Any] = {}
@@ -2527,6 +2690,16 @@ def _build_hunyuan_edit_extra_args(
         extra_args["system_prompt"] = system_prompt
     if bot_task is not None:
         extra_args["bot_task"] = bot_task
+    if assistant_prompt is not None:
+        extra_args["assistant_prompt"] = assistant_prompt
+    if cond_vae_images is not None:
+        extra_args["cond_vae_images"] = cond_vae_images
+    if cond_timesteps is not None:
+        extra_args["cond_timesteps"] = cond_timesteps
+    if infer_align_image_size:
+        extra_args["infer_align_image_size"] = True
+    if return_postprocess_meta is not None:
+        extra_args["return_postprocess_meta"] = return_postprocess_meta
     return extra_args
 
 

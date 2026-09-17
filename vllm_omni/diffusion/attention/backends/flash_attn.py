@@ -415,5 +415,5 @@ class FlashAttentionImpl(AttentionImpl):
             attn_mask=attention_mask,
             opt_mode="manual",
             op_type="fused_attn_score",
-            layout=layout,
+            layout="BSND",
         )

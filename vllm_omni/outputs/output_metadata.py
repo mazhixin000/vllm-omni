@@ -10,7 +10,7 @@ import PIL.Image
 import torch
 
 # Final user-facing output modality returned by pipeline stages.
-FinalOutputModalityType: TypeAlias = Literal["text", "image", "audio", "video"]
+FinalOutputModalityType: TypeAlias = Literal["text", "image", "audio", "video", "latents"]
 
 # Scalar values that may appear in either payload or metadata.
 # Examples: text_output="done", fps=16, action_only_output=True.
