@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Ascend-specific RoPE implementation for HunyuanImage3."""
+"""Ascend-specific operator optimizations for HunyuanImage3."""
 
 from __future__ import annotations
 
@@ -17,8 +17,10 @@ logger = init_logger(__name__)
 
 _FUSED_ROPE_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_ROPE"
 _ROPE_PREEXPAND_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_ROPE_PREEXPAND"
+_FUSED_ADD_RMS_NORM_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_ADD_RMS_NORM"
 _DISABLED_VALUES = frozenset({"0", "false", "no", "off", "disabled", "disable"})
 _missing_fused_rope_logged = False
+_missing_fused_add_rms_norm_logged = False
 
 
 def _is_optimization_enabled(env_name: str) -> bool:
@@ -40,6 +42,56 @@ def is_hunyuan_image3_fused_rope_enabled() -> bool:
 def is_hunyuan_image3_fused_rope_available() -> bool:
     """Return whether the enabled HunyuanImage3 fused RoPE API is callable."""
     return is_hunyuan_image3_fused_rope_enabled() and callable(getattr(torch_npu, "npu_apply_rotary_pos_emb", None))
+
+
+def is_hunyuan_image3_fused_add_rms_norm_enabled() -> bool:
+    """Return whether HunyuanImage3 fused Add+RMSNorm is enabled.
+
+    The optimization is enabled by default. Set
+    ``VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_ADD_RMS_NORM=0`` before starting the
+    process to restore the separate residual add and RMSNorm calls.
+    """
+    return _is_optimization_enabled(_FUSED_ADD_RMS_NORM_ENV)
+
+
+def is_hunyuan_image3_fused_add_rms_norm_available() -> bool:
+    """Return whether the enabled fused Add+RMSNorm API is callable."""
+    return is_hunyuan_image3_fused_add_rms_norm_enabled() and callable(getattr(torch_npu, "npu_add_rms_norm", None))
+
+
+def apply_hunyuan_image3_add_rms_norm_npu(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    fallback: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse the post-attention residual add and RMSNorm when available.
+
+    The second returned tensor is the sum before normalization and remains the
+    residual for the following MLP branch. Runtime errors from the fused operator
+    are not caught because the operator may have already modified its inputs.
+    """
+    global _missing_fused_add_rms_norm_logged
+
+    fused_enabled = is_hunyuan_image3_fused_add_rms_norm_enabled()
+    fused_add_rms_norm = cast(
+        Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None,
+        getattr(torch_npu, "npu_add_rms_norm", None) if fused_enabled else None,
+    )
+    if not callable(fused_add_rms_norm):
+        if not _missing_fused_add_rms_norm_logged:
+            reason = f"disabled by {_FUSED_ADD_RMS_NORM_ENV}" if not fused_enabled else "unavailable in torch-npu"
+            logger.debug(
+                "HunyuanImage3 fused Add+RMSNorm is %s; using separate residual add and RMSNorm calls",
+                reason,
+            )
+            _missing_fused_add_rms_norm_logged = True
+        added = residual + hidden_states
+        return fallback(added), added
+
+    normalized, _, added = fused_add_rms_norm(hidden_states, residual, weight, epsilon)
+    return normalized, added
 
 
 def is_hunyuan_image3_rope_preexpand_enabled() -> bool:
@@ -183,8 +235,11 @@ def apply_hunyuan_image3_rope_npu(
 
 
 __all__ = [
+    "apply_hunyuan_image3_add_rms_norm_npu",
     "apply_hunyuan_image3_rope_npu",
     "can_preexpand_hunyuan_image3_rope",
+    "is_hunyuan_image3_fused_add_rms_norm_available",
+    "is_hunyuan_image3_fused_add_rms_norm_enabled",
     "is_hunyuan_image3_fused_rope_available",
     "is_hunyuan_image3_fused_rope_enabled",
     "is_hunyuan_image3_rope_preexpand_enabled",

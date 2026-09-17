@@ -932,6 +932,27 @@ def _apply_hunyuan_image3_rope(
     return rope(query, cos, sin), rope(key, cos, sin)
 
 
+def _apply_hunyuan_image3_add_rms_norm(
+    norm: RMSNorm,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Add the residual and apply RMSNorm through the current platform."""
+    if current_omni_platform.is_npu():
+        from vllm_omni.platforms.npu.models.hunyuan_image3 import apply_hunyuan_image3_add_rms_norm_npu
+
+        return apply_hunyuan_image3_add_rms_norm_npu(
+            hidden_states,
+            residual,
+            norm.weight,
+            norm.variance_epsilon,
+            norm,
+        )
+
+    added = residual + hidden_states
+    return norm(added), added
+
+
 class HunYuanRotary2DEmbedder:
     r"""
     A RoPE wrapper specifically designed for HunYuan-Image attention.
@@ -2046,10 +2067,12 @@ class HunyuanImage3DecoderLayer(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
+        hidden_states, residual = _apply_hunyuan_image3_add_rms_norm(
+            self.post_attention_layernorm,
+            hidden_states,
+            residual,
+        )
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
 
         hidden_states = residual + hidden_states

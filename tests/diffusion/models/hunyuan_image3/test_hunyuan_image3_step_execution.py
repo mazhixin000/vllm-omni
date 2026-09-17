@@ -540,3 +540,44 @@ def test_preexpanded_rope_requires_matching_rank():
             first_step=False,
             device=torch.device("cpu"),
         )
+
+
+def test_decoder_layer_uses_fused_add_rms_norm_residual(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The decoder must use the fused Add result as the MLP residual."""
+    fused_calls = []
+
+    def fused_add_rms_norm(norm, hidden_states, residual):
+        fused_calls.append((norm, hidden_states, residual))
+        return hidden_states + 5, hidden_states + residual
+
+    class Attention(nn.Module):
+        def forward(self, hidden_states, **kwargs):
+            del kwargs
+            return hidden_states + 1, "attention-weights", "present-key-value"
+
+    class MLP(nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states * 2
+
+    monkeypatch.setattr(
+        transformer_module,
+        "_apply_hunyuan_image3_add_rms_norm",
+        fused_add_rms_norm,
+    )
+    layer = transformer_module.HunyuanImage3DecoderLayer.__new__(transformer_module.HunyuanImage3DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.input_layernorm = nn.Identity()
+    layer.post_attention_layernorm = nn.Identity()
+    layer.self_attn = Attention()
+    layer.mlp = MLP()
+    hidden_states = torch.ones(1, 2, 4)
+
+    outputs = layer(hidden_states, output_attentions=True, use_cache=True)
+
+    assert len(fused_calls) == 1
+    norm, attention_output, residual = fused_calls[0]
+    assert norm is layer.post_attention_layernorm
+    torch.testing.assert_close(attention_output, torch.full_like(hidden_states, 2))
+    assert residual is hidden_states
+    torch.testing.assert_close(outputs[0], torch.full_like(hidden_states, 17))
+    assert outputs[1:] == ("attention-weights", "present-key-value")
