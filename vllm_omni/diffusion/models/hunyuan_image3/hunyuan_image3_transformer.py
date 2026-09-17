@@ -4,6 +4,7 @@
 import inspect
 import logging
 import math
+import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -63,7 +64,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
-    get_allgather_parallel_world_size,
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
@@ -85,6 +85,62 @@ from vllm_omni.model_executor.layers.timestep_embedding import timestep_embeddin
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
+
+_HUNYUAN_IMAGE3_COMPRESSED_KV_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_COMPRESSED_KV"
+_HUNYUAN_IMAGE3_BSND_ATTN_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_BSND_ATTENTION"
+_DISABLED_OPTIMIZATION_VALUES = frozenset({"0", "false", "no", "off", "disabled", "disable"})
+_compressed_kv_status_logged = False
+_bsnd_attention_status_logged = False
+
+
+def _is_hunyuan_image3_compressed_kv_enabled() -> bool:
+    """Return whether HunyuanImage3 should keep GQA K/V heads compressed.
+
+    The optimization is enabled by default. Set
+    ``VLLM_OMNI_HUNYUAN_IMAGE3_COMPRESSED_KV=0`` before model initialization
+    to restore the original K/V head expansion.
+    """
+    value = os.environ.get(_HUNYUAN_IMAGE3_COMPRESSED_KV_ENV, "").strip().lower()
+    return value not in _DISABLED_OPTIMIZATION_VALUES
+
+
+def _is_hunyuan_image3_bsnd_attention_enabled() -> bool:
+    """Return whether HunyuanImage3 should use the native BSND attention layout.
+
+    The optimization is enabled by default. Set
+    ``VLLM_OMNI_HUNYUAN_IMAGE3_BSND_ATTENTION=0`` before model initialization
+    to restore the backend's legacy default layout.
+    """
+    value = os.environ.get(_HUNYUAN_IMAGE3_BSND_ATTN_ENV, "").strip().lower()
+    return value not in _DISABLED_OPTIMIZATION_VALUES
+
+
+def _log_hunyuan_image3_compressed_kv_status(enabled: bool, num_heads: int, num_kv_heads: int) -> None:
+    global _compressed_kv_status_logged
+    if _compressed_kv_status_logged:
+        return
+    logger.info(
+        "HunyuanImage3 compressed K/V optimization is %s: Q heads=%d, K/V heads=%d, repeat_kv=%s; "
+        "set %s=0 to restore K/V expansion.",
+        "enabled" if enabled else "disabled",
+        num_heads,
+        num_kv_heads,
+        "skipped" if enabled else "enabled",
+        _HUNYUAN_IMAGE3_COMPRESSED_KV_ENV,
+    )
+    _compressed_kv_status_logged = True
+
+
+def _log_hunyuan_image3_bsnd_attention_status(enabled: bool) -> None:
+    global _bsnd_attention_status_logged
+    if _bsnd_attention_status_logged:
+        return
+    logger.info(
+        "HunyuanImage3 native BSND attention layout optimization is %s; set %s=0 to restore the legacy layout.",
+        "enabled" if enabled else "disabled",
+        _HUNYUAN_IMAGE3_BSND_ATTN_ENV,
+    )
+    _bsnd_attention_status_logged = True
 
 
 def _is_moe(config: PretrainedConfig) -> bool:
@@ -823,6 +879,85 @@ class LightProjector(nn.Module):
         return self.layers(x)
 
 
+def _prepare_hunyuan_image3_rope_frequencies(
+    custom_pos_emb: tuple[torch.Tensor, torch.Tensor] | None,
+    hidden_states: torch.Tensor,
+    mode: str,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Prepare one full-width RoPE pair for all local decoder layers.
+
+    Position selection and sequence-parallel sharding intentionally happen
+    before this helper. Consequently, only the current rank's current-query
+    frequencies are materialized. Non-NPU and non-image paths remain unchanged.
+    """
+    if mode != "gen_image" or custom_pos_emb is None or not current_omni_platform.is_npu():
+        return custom_pos_emb
+
+    from vllm_omni.platforms.npu.models.hunyuan_image3 import (
+        can_preexpand_hunyuan_image3_rope,
+        prepare_hunyuan_image3_rope_frequencies_npu,
+    )
+
+    # Check if the user has manually closed it
+    if not can_preexpand_hunyuan_image3_rope():
+        return custom_pos_emb
+
+    cos, sin = custom_pos_emb
+    return prepare_hunyuan_image3_rope_frequencies_npu(
+        cos,
+        sin,
+        batch_size=hidden_states.shape[0],
+        seq_len=hidden_states.shape[1],
+        head_dim=head_dim,
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+
+
+def _apply_hunyuan_image3_rope(
+    rope: RotaryEmbedding,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply image RoPE to Q/K through the current platform implementation.
+
+    The default path preserves the existing behavior of applying the single-input
+    RoPE operator to query and key independently. Ascend uses a model-local helper
+    that can replace those two launches with ``npu_apply_rotary_pos_emb`` without
+    adding a torch-npu dependency to this platform-neutral model module.
+    """
+    if current_omni_platform.is_npu():
+        from vllm_omni.platforms.npu.models.hunyuan_image3 import apply_hunyuan_image3_rope_npu
+
+        return apply_hunyuan_image3_rope_npu(rope, query, key, cos, sin)
+
+    return rope(query, cos, sin), rope(key, cos, sin)
+
+
+def _apply_hunyuan_image3_add_rms_norm(
+    norm: RMSNorm,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Add the residual and apply RMSNorm through the current platform."""
+    if current_omni_platform.is_npu():
+        from vllm_omni.platforms.npu.models.hunyuan_image3 import apply_hunyuan_image3_add_rms_norm_npu
+
+        return apply_hunyuan_image3_add_rms_norm_npu(
+            hidden_states,
+            residual,
+            norm.weight,
+            norm.variance_epsilon,
+            norm,
+        )
+
+    added = residual + hidden_states
+    return norm(added), added
+
+
 class HunYuanRotary2DEmbedder:
     r"""
     A RoPE wrapper specifically designed for HunYuan-Image attention.
@@ -863,9 +998,28 @@ class HunYuanRotary2DEmbedder:
         first_step: bool,
         device: torch.device,
     ):
-        """Returns cos/sin on the target device based on first_step and caching strategy."""
+        """Return current cos/sin while preserving the half-width cache policy.
+
+        Model-level pre-expanded tensors are request-local and already shared
+        by all decoder layers. They must bypass the layer-local half-width cache
+        so a previous request can never replace the current forward's values.
+        """
+        cos_input, sin_input = custom_pos_emb
+        if cos_input.ndim == 4 or sin_input.ndim == 4:
+            if cos_input.ndim != 4 or sin_input.ndim != 4:
+                raise ValueError("Pre-expanded cos and sin must both be four-dimensional")
+            if cos_input.shape != sin_input.shape:
+                raise ValueError("Pre-expanded cos and sin must have identical shapes")
+            if cos_input.shape[2] != 1 or cos_input.shape[-1] != self.head_dim:
+                raise ValueError(
+                    f"Pre-expanded RoPE frequencies must have shape [B, S, 1, {self.head_dim}], got {cos_input.shape}"
+                )
+            self.custom_pos_emb = None
+            if cos_input.device != device:
+                return cos_input.to(device), sin_input.to(device)
+            return cos_input, sin_input
+
         if first_step:
-            cos_input, sin_input = custom_pos_emb
             cos = cos_input.to(device)
             sin = sin_input.to(device)
             self.custom_pos_emb = None
@@ -903,15 +1057,19 @@ class HunYuanRotary2DEmbedder:
         q_len = query_lens[0]
         assert hidden_states.shape[0] == bs * q_len, f"{hidden_states.shape[0]} != {bs * q_len}"
 
-        # 3. Reshape + transpose for apply_rotary_pos_emb
-        #    Assume q shape [B*L, H*D] -> [2, L, H, D] -> [2, H, L, D]
-        q = q.reshape(bs, q_len, self.num_heads, self.head_dim)
-        k = k.reshape(bs, q_len, self.num_kv_heads, self.head_dim)
+        # 3. Restore the BSND layout expected by the image RoPE kernels.
+        #    q: [B*L, Hq*D] -> [B, L, Hq, D]
+        #    k: [B*L, Hkv*D] -> [B, L, Hkv, D]
+        q = q.reshape(bs, q_len, self.num_heads, self.head_dim).to(torch.float32)
+        k = k.reshape(bs, q_len, self.num_kv_heads, self.head_dim).to(torch.float32)
 
-        q = self.rope(q.to(torch.float32), cos, sin)
-        k = self.rope(k.to(torch.float32), cos, sin)
+        # Keep the established FP32 RoPE path. On Ascend, the platform helper
+        # applies RoPE to Q and K in one fused launch when the official API is
+        # available; other platforms and older torch-npu versions retain the
+        # existing pair of single-input calls.
+        q, k = _apply_hunyuan_image3_rope(self.rope, q, k, cos, sin)
 
-        # 5. Restore original shape + convert to bfloat16
+        # 4. Restore original shape + convert to bfloat16
         q = q.reshape(hidden_states.shape[0], self.num_heads * self.head_dim).to(torch.bfloat16)
         k = k.reshape(hidden_states.shape[0], self.num_kv_heads * self.head_dim).to(torch.bfloat16)
         hidden_states = hidden_states.reshape(hidden_states_shape)
@@ -949,14 +1107,18 @@ class ImageKVCacheManager:
         self._injected_ar_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         self.sp_size = get_sequence_parallel_world_size()
-        self.allgather_size = get_allgather_parallel_world_size()
         self.sp_rank = get_sequence_parallel_rank()
+        self.use_compressed_kv = _is_hunyuan_image3_compressed_kv_enabled()
+        _log_hunyuan_image3_compressed_kv_status(self.use_compressed_kv, self.num_heads, self.num_kv_heads)
+        self.use_bsnd_attention = _is_hunyuan_image3_bsnd_attention_enabled()
+        _log_hunyuan_image3_bsnd_attention_status(self.use_bsnd_attention)
         self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
+            qkv_layout="BSND" if self.use_bsnd_attention else None,
             prefix=f"{prefix}.attn" if prefix else "",
         )
 
@@ -1122,8 +1284,6 @@ class ImageKVCacheManager:
 
         head_num_per_rank = query.shape[1]
         kv_head_num_per_rank = key.shape[1]
-        repeat_num = head_num_per_rank // kv_head_num_per_rank
-        keep_kv_compressed = self.allgather_size > 1
         head_dim = query.shape[2]
 
         query = query.reshape(bs, q_len, head_num_per_rank, head_dim)
@@ -1165,7 +1325,8 @@ class ImageKVCacheManager:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._reuse_prompt_kv(key, value, seq_len, bs, shard_image_size)
 
-        if not keep_kv_compressed:
+        if not self.use_compressed_kv:
+            repeat_num = head_num_per_rank // kv_head_num_per_rank
             key = repeat_kv(key, repeat_num)
             value = repeat_kv(value, repeat_num)
             if self.sp_size > 1:
@@ -1971,11 +2132,17 @@ class HunyuanImage3DecoderLayer(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
-
+        # Fused Add+RMSNorm. When the runtime patch
+        # ``vllm_omni.diffusion.patches.hunyuan_image3_fusion`` is active it
+        # replaces this ``forward`` with an in-layer + cross-layer fused variant
+        # (DIT_FUSE_ADD_RMSNORM=1 by default), so this path acts as the
+        # in-model fallback.
+        hidden_states, residual = _apply_hunyuan_image3_add_rms_norm(
+            self.post_attention_layernorm,
+            hidden_states,
+            residual,
+        )
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -2094,8 +2261,8 @@ class HunyuanImage3Model(nn.Module):
         "pre_processor": {
             1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
             3: SequenceParallelInput(split_dim=1, expected_dims=2, split_output=True, auto_pad=True),
-            5: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # sin
-            7: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # cos
+            5: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # cos
+            7: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),  # sin
         },
         "post_processor": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
@@ -2106,6 +2273,12 @@ class HunyuanImage3Model(nn.Module):
         self.num_redundant_experts = 0
         self.config = config
         self.device = get_local_device()
+        if getattr(config, "head_dim", None):
+            self.rope_head_dim = config.head_dim
+        elif getattr(config, "attention_head_dim", None):
+            self.rope_head_dim = config.attention_head_dim
+        else:
+            self.rope_head_dim = config.hidden_size // config.num_attention_heads
 
         self.quant_config = quant_config
         logger.debug(f"quant_config: {quant_config}")
@@ -2479,10 +2652,10 @@ class HunyuanImage3Model(nn.Module):
                 image_hidden_states,
                 text_position_ids,
                 image_position_ids,
-                text_custom_pos_emb_sin,
-                image_custom_pos_emb_sin,
                 text_custom_pos_emb_cos,
                 image_custom_pos_emb_cos,
+                text_custom_pos_emb_sin,
+                image_custom_pos_emb_sin,
             ) = self.pre_processor(
                 hidden_states,
                 custom_pos_emb,
@@ -2513,13 +2686,13 @@ class HunyuanImage3Model(nn.Module):
                 hidden_states = self.unifiled_cat(text_hidden_states, image_hidden_states, dim=1)
                 position_ids = self.unifiled_cat(text_position_ids, image_position_ids, dim=1)
                 custom_pos_emb = (
-                    self.unifiled_cat(text_custom_pos_emb_sin, image_custom_pos_emb_sin, dim=1),
                     self.unifiled_cat(text_custom_pos_emb_cos, image_custom_pos_emb_cos, dim=1),
+                    self.unifiled_cat(text_custom_pos_emb_sin, image_custom_pos_emb_sin, dim=1),
                 )
             else:
                 hidden_states = image_hidden_states
                 position_ids = image_position_ids
-                custom_pos_emb = (image_custom_pos_emb_sin, image_custom_pos_emb_cos)
+                custom_pos_emb = (image_custom_pos_emb_cos, image_custom_pos_emb_sin)
 
             if shard_padding_size > 0:
                 B, H, Q, K = attention_mask.shape
@@ -2530,6 +2703,16 @@ class HunyuanImage3Model(nn.Module):
 
                 k_pad = attention_mask.new_zeros(B, H, Q + pad, pad)
                 attention_mask = torch.cat((attention_mask, k_pad), dim=3)
+
+        # Sequence-parallel sharding must finish before expansion so each rank
+        # materializes only its local query positions. The resulting full-width
+        # pair is shared by every decoder layer in this model forward.
+        custom_pos_emb = _prepare_hunyuan_image3_rope_frequencies(
+            custom_pos_emb,
+            hidden_states,
+            mode,
+            self.rope_head_dim,
+        )
 
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:

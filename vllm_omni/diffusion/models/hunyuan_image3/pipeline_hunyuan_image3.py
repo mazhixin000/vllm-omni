@@ -522,15 +522,14 @@ class HunyuanImage3Pipeline(
             "gate_and_up_proj.": "gate_up_proj.",
         },
     )
+    # Keep only request-level components needed for performance analysis.
+    # The existing profiler synchronizes around each target for valid NPU wall time;
+    # avoiding layer-level targets keeps synchronization and logging overhead small.
     _PROFILER_TARGETS = [
         "model.forward",
-        "model.layers[0].forward",
-        "model.layers[0].self_attn.forward",
-        "model.layers[0].mlp.forward",
+        "vision_model.forward",
         "vae.encode",
         "vae.decode",
-        "patch_embed.forward",
-        "final_layer.forward",
     ]
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
