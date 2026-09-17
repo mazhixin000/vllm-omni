@@ -406,9 +406,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 gen_device = "cpu"
             else:
                 gen_device = self.device
-            # sampling_params.generator = torch.Generator(device=gen_device).manual_seed(sampling_params.seed)
-            sampling_params.generator = torch.Generator(device="cpu").manual_seed(sampling_params.seed)
-
+            sampling_params.generator = torch.Generator(device=gen_device).manual_seed(sampling_params.seed)
 
     def _refresh_cache_for_requests(
         self,
