@@ -19,6 +19,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _TRANSFORMER_MODULE = "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer"
 _COMPRESSED_KV_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_COMPRESSED_KV"
+_BSND_ATTN_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_BSND_ATTENTION"
 
 NUM_HEADS = 8
 NUM_KV_HEADS = 2
@@ -39,6 +40,7 @@ class MockAttention(nn.Module):
         self.last_key = None
         self.last_value = None
         self.last_attn_metadata = None
+        self.qkv_layout = kwargs.get("qkv_layout")
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
         self.last_key = key
@@ -511,7 +513,29 @@ def test_cross_request_isolation():
 
 
 # ============================================================
-# Test 5: HunyuanImage3 compressed K/V optimization switch
+# Test 5: HunyuanImage3 BSND attention layout optimization switch
+# ============================================================
+
+
+def test_bsnd_attention_enabled_by_default(monkeypatch):
+    monkeypatch.delenv(_BSND_ATTN_ENV, raising=False)
+    mgr = _make_cache_mgr()
+
+    assert mgr.use_bsnd_attention is True
+    assert mgr.attn.qkv_layout == "BSND"
+
+
+@pytest.mark.parametrize("disabled_value", ["0", "false", "no", "off", "disabled", "disable", " FALSE "])
+def test_bsnd_attention_can_be_disabled(monkeypatch, disabled_value):
+    monkeypatch.setenv(_BSND_ATTN_ENV, disabled_value)
+    mgr = _make_cache_mgr()
+
+    assert mgr.use_bsnd_attention is False
+    assert mgr.attn.qkv_layout is None
+
+
+# ============================================================
+# Test 6: HunyuanImage3 compressed K/V optimization switch
 # ============================================================
 
 

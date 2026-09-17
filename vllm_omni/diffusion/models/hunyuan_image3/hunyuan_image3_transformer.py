@@ -86,8 +86,10 @@ from vllm_omni.platforms import current_omni_platform
 logger = logging.getLogger(__name__)
 
 _HUNYUAN_IMAGE3_COMPRESSED_KV_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_COMPRESSED_KV"
+_HUNYUAN_IMAGE3_BSND_ATTN_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_BSND_ATTENTION"
 _DISABLED_OPTIMIZATION_VALUES = frozenset({"0", "false", "no", "off", "disabled", "disable"})
 _compressed_kv_status_logged = False
+_bsnd_attention_status_logged = False
 
 
 def _is_hunyuan_image3_compressed_kv_enabled() -> bool:
@@ -98,6 +100,17 @@ def _is_hunyuan_image3_compressed_kv_enabled() -> bool:
     to restore the original K/V head expansion.
     """
     value = os.environ.get(_HUNYUAN_IMAGE3_COMPRESSED_KV_ENV, "").strip().lower()
+    return value not in _DISABLED_OPTIMIZATION_VALUES
+
+
+def _is_hunyuan_image3_bsnd_attention_enabled() -> bool:
+    """Return whether HunyuanImage3 should use the native BSND attention layout.
+
+    The optimization is enabled by default. Set
+    ``VLLM_OMNI_HUNYUAN_IMAGE3_BSND_ATTENTION=0`` before model initialization
+    to restore the backend's legacy default layout.
+    """
+    value = os.environ.get(_HUNYUAN_IMAGE3_BSND_ATTN_ENV, "").strip().lower()
     return value not in _DISABLED_OPTIMIZATION_VALUES
 
 
@@ -115,6 +128,18 @@ def _log_hunyuan_image3_compressed_kv_status(enabled: bool, num_heads: int, num_
         _HUNYUAN_IMAGE3_COMPRESSED_KV_ENV,
     )
     _compressed_kv_status_logged = True
+
+
+def _log_hunyuan_image3_bsnd_attention_status(enabled: bool) -> None:
+    global _bsnd_attention_status_logged
+    if _bsnd_attention_status_logged:
+        return
+    logger.info(
+        "HunyuanImage3 native BSND attention layout optimization is %s; set %s=0 to restore the legacy layout.",
+        "enabled" if enabled else "disabled",
+        _HUNYUAN_IMAGE3_BSND_ATTN_ENV,
+    )
+    _bsnd_attention_status_logged = True
 
 
 def _is_moe(config: PretrainedConfig) -> bool:
@@ -1059,12 +1084,15 @@ class ImageKVCacheManager:
         self.sp_rank = get_sequence_parallel_rank()
         self.use_compressed_kv = _is_hunyuan_image3_compressed_kv_enabled()
         _log_hunyuan_image3_compressed_kv_status(self.use_compressed_kv, self.num_heads, self.num_kv_heads)
+        self.use_bsnd_attention = _is_hunyuan_image3_bsnd_attention_enabled()
+        _log_hunyuan_image3_bsnd_attention_status(self.use_bsnd_attention)
         self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
+            qkv_layout="BSND" if self.use_bsnd_attention else None,
             prefix=f"{prefix}.attn" if prefix else "",
         )
 

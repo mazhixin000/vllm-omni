@@ -9,6 +9,9 @@ This script tests two main scenarios:
 2. Case 2: Comparing FlashAttention and SDPA backends for batch_size=2 with padding
 """
 
+import sys
+import types
+
 import pytest
 import torch
 
@@ -369,6 +372,87 @@ def test_packed_varlen_metadata_must_be_complete(monkeypatch):
 
     with pytest.raises(ValueError, match="Incomplete packed FlashAttention metadata"):
         impl.forward_cuda(query, query, query, metadata)
+
+
+@pytest.mark.parametrize(
+    ("qkv_layout", "expected_layout", "expects_transpose"),
+    [(None, "BNSD", True), ("BSND", "BSND", False)],
+)
+def test_npu_fp8_attention_respects_qkv_layout(monkeypatch, qkv_layout, expected_layout, expects_transpose):
+    calls = []
+
+    def fake_fp8_rotate_quant_fa(query, key, value, **kwargs):
+        calls.append((query.shape, key.shape, value.shape, kwargs))
+        return query
+
+    module_name = "vllm_omni.platforms.npu.quant.kv_quant_npu"
+    fake_module = types.ModuleType(module_name)
+    monkeypatch.setattr(fake_module, "fp8_rotate_quant_fa", fake_fp8_rotate_quant_fa, raising=False)
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+
+    impl = FlashAttentionImpl(
+        num_heads=4,
+        num_kv_heads=2,
+        head_size=5,
+        softmax_scale=0.25,
+        causal=False,
+        qkv_layout=qkv_layout,
+    )
+    query = torch.randn(2, 3, 4, 5)
+    key = torch.randn(2, 3, 2, 5)
+    value = torch.randn(2, 3, 2, 5)
+
+    output = impl.forward_fa_quant_npu(query, key, value)
+
+    expected_query_shape = torch.Size([2, 4, 3, 5]) if expects_transpose else query.shape
+    expected_key_shape = torch.Size([2, 2, 3, 5]) if expects_transpose else key.shape
+    assert output.shape == query.shape
+    assert calls == [
+        (
+            expected_query_shape,
+            expected_key_shape,
+            expected_key_shape,
+            {"layout": expected_layout, "softmax_scale": 0.25},
+        )
+    ]
+
+
+def test_npu_attention_passes_explicit_bsnd_layout(monkeypatch):
+    calls = []
+
+    def fake_attention_forward(query, key, value, **kwargs):
+        calls.append((query, key, value, kwargs))
+        return query
+
+    fake_module = types.ModuleType("mindiesd")
+    monkeypatch.setattr(fake_module, "attention_forward", fake_attention_forward, raising=False)
+    monkeypatch.setitem(sys.modules, "mindiesd", fake_module)
+
+    impl = FlashAttentionImpl(
+        num_heads=4,
+        num_kv_heads=2,
+        head_size=5,
+        softmax_scale=0.25,
+        causal=False,
+        qkv_layout="BSND",
+    )
+    query = torch.randn(2, 3, 4, 5)
+    key = torch.randn(2, 3, 2, 5)
+    value = torch.randn(2, 3, 2, 5)
+
+    output = impl.forward_fa_npu(query, key, value)
+
+    passed_query, passed_key, passed_value, kwargs = calls[0]
+    assert output is query
+    assert passed_query is query
+    assert passed_key is key
+    assert passed_value is value
+    assert kwargs == {
+        "attn_mask": None,
+        "opt_mode": "manual",
+        "op_type": "fused_attn_score",
+        "layout": "BSND",
+    }
 
 
 if __name__ == "__main__":
