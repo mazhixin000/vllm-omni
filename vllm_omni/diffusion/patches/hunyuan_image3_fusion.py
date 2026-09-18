@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """HunyuanImage3 的额外 Ascend 平台补丁。
 
-模型内已经正式支持 RoPE Q/K、cos/sin 预展开、压缩 KV 和 Add+RMSNorm，
-这里不再重复替换对应的模型方法，只保留两项独立能力：
+模型内已经正式支持 RoPE Q/K、cos/sin 预展开、压缩 KV、Add+RMSNorm 以及
+SwiGLU 融合，SwiGLU 相关实现已迁移至
+``vllm_omni/platforms/npu/models/hunyuan_image3.py``，本文件只保留：
 
-* 为 vLLM 的 ``SiluAndMul`` 补充 Ascend ``npu_swiglu`` 实现；
 * 可选的 HunyuanImage3 MegaMoE 接管。
 
 环境变量：
-  DIT_FUSE_SWIGLU       默认 1（开）
   DIT_ENABLE_MEGA_MOE   默认 0（关）
   DIT_FUSE_LOG          默认 1（打印生效日志）
 """
@@ -23,7 +22,6 @@ def _flag(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip() not in ("0", "", "false", "False")
 
 
-FUSE_SWIGLU = _flag("DIT_FUSE_SWIGLU")
 # CANN MegaMoE：把 MoE 的 dispatch / grouped-matmul / routing / combine 一次融合。
 # 仅在显式设置 DIT_ENABLE_MEGA_MOE=1、torch_npu 可用且已安装
 # npu_ops_transformer 时接管 HunYuanSparseMoeBlock；默认关闭。
@@ -45,65 +43,6 @@ try:
 except Exception as _e:  # pragma: no cover
     HAS_NPU = False
     _log(f"torch_npu unavailable ({_e!r}); patches will not take effect.")
-
-
-# ==================================================================
-# SwiGLU 融合 (SiluAndMul -> npu_swiglu)
-# ==================================================================
-# 背景：vLLM 上游 `vllm.model_executor.layers.activation.SiluAndMul`
-# 只实现了 forward_cuda/native/xpu/cpu 四种，**没有 forward_npu**。
-# `CustomOp.dispatch_forward` 在 NPU 平台走 `is_out_of_tree() -> forward_oot`，
-# 而 CustomOp 默认的 `forward_oot` 直接 fallback 到 `forward_native`：
-#     d = x.shape[-1] // 2
-#     return F.silu(x[..., :d]) * x[..., d:]
-# 展开成 `Slice + Silu(Swish) + Mul` 三个独立 kernel（正是 profile 里
-# shared_experts 分支看到的序列）。
-#
-# 我们改成：直接把 SiluAndMul 类的 forward_oot 替换成 `torch_npu.npu_swiglu`，
-# 这样 **所有** NPU 上创建的 `SiluAndMul()` 实例（无论何时创建、是否被
-# `torch.compile` 编译入图，只要还没进 dispatcher 的阶段就取到 forward_oot）
-# 都会得到融合，HunyuanImage3 的普通 MLP 和 shared expert 因而共用同一条
-# 清晰的算子级实现，不再额外替换各自的 ``forward``。
-def _patch_silu_and_mul_forward_oot() -> None:
-    """给 vLLM 上游 SiluAndMul 补一个 forward_oot(npu) 实现。"""
-    if not FUSE_SWIGLU:
-        return
-    if not HAS_NPU:
-        return
-    try:
-        from vllm.model_executor.layers.activation import SiluAndMul
-    except Exception as e:
-        _log(f"cannot import SiluAndMul: {e!r}")
-        return
-
-    import torch_npu
-
-    warn_holder = {"warned": False}
-
-    # 如果已被别人（e.g. 未来版本 vllm-ascend）改过，就不要再叠加了。
-    if getattr(SiluAndMul, "_omni_swiglu_patched", False):
-        _log("SiluAndMul.forward_oot already patched by another module; skip")
-        return
-
-    def forward_oot(self, x):
-        try:
-            return torch_npu.npu_swiglu(x)
-        except Exception as e:
-            if not warn_holder["warned"]:
-                _log(f"npu_swiglu failed, fallback to native: {e!r}")
-                warn_holder["warned"] = True
-            # native fallback：等价于原 forward_native
-            d = x.shape[-1] // 2
-            import torch.nn.functional as F
-            return F.silu(x[..., :d]) * x[..., d:]
-
-    SiluAndMul._orig_forward_oot = SiluAndMul.forward_oot
-    SiluAndMul.forward_oot = forward_oot
-    SiluAndMul._omni_swiglu_patched = True
-    _log("patched SiluAndMul.forward_oot  (native Slice+Silu+Mul -> npu_swiglu)")
-
-
-_patch_silu_and_mul_forward_oot()
 
 
 # ==================================================================

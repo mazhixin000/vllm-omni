@@ -18,9 +18,12 @@ logger = init_logger(__name__)
 _FUSED_ROPE_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_ROPE"
 _ROPE_PREEXPAND_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_ROPE_PREEXPAND"
 _FUSED_ADD_RMS_NORM_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_ADD_RMS_NORM"
+_FUSED_SWIGLU_ENV = "DIT_FUSE_SWIGLU"
+_FUSED_SWIGLU_LOG_ENV = "DIT_FUSE_LOG"
 _DISABLED_VALUES = frozenset({"0", "false", "no", "off", "disabled", "disable"})
 _missing_fused_rope_logged = False
 _missing_fused_add_rms_norm_logged = False
+_fused_swiglu_patched = False
 
 
 def _is_optimization_enabled(env_name: str) -> bool:
@@ -233,14 +236,136 @@ def apply_hunyuan_image3_rope_npu(
     )
 
 
+# ==================================================================
+# SwiGLU 融合 (SiluAndMul -> npu_swiglu)
+# ==================================================================
+# 背景：vLLM 上游 ``vllm.model_executor.layers.activation.SiluAndMul`` 只实现
+# 了 forward_cuda/native/xpu/cpu，没有 forward_npu。``CustomOp.dispatch_forward``
+# 在 NPU 平台走 ``is_out_of_tree() -> forward_oot``，而 CustomOp 默认的
+# ``forward_oot`` 会 fallback 到 ``forward_native``（Slice + Silu + Mul 三个
+# 独立 kernel）。这里通过一次 monkey-patch 把 ``SiluAndMul.forward_oot`` 替
+# 换成 ``torch_npu.npu_swiglu``，使 NPU 上所有 ``SiluAndMul`` 实例（包括
+# HunyuanImage3 的普通 MLP 与 shared expert）复用同一条融合实现。
+
+
+def _fused_swiglu_log_enabled() -> bool:
+    """SwiGLU patch 生效日志是否开启（默认开）。"""
+    return _is_optimization_enabled(_FUSED_SWIGLU_LOG_ENV)
+
+
+def _log_swiglu(msg: str) -> None:
+    if _fused_swiglu_log_enabled():
+        print(f"[hunyuan_image3_fusion] {msg}", flush=True)
+
+
+def is_hunyuan_image3_fused_swiglu_enabled() -> bool:
+    """Return whether HunyuanImage3 fused SwiGLU (SiluAndMul->npu_swiglu) is enabled.
+
+    The optimization is enabled by default. Set ``DIT_FUSE_SWIGLU=0`` before
+    starting the process to fall back to the native Slice + Silu + Mul path.
+    """
+    return _is_optimization_enabled(_FUSED_SWIGLU_ENV)
+
+
+def is_hunyuan_image3_fused_swiglu_available() -> bool:
+    """Return whether the enabled fused SwiGLU API is callable."""
+    return is_hunyuan_image3_fused_swiglu_enabled() and callable(getattr(torch_npu, "npu_swiglu", None))
+
+
+def apply_hunyuan_image3_fused_swiglu_patch() -> bool:
+    """Install ``torch_npu.npu_swiglu`` as ``SiluAndMul`` forward path.
+    Idempotent: safe to call multiple times. Returns ``True`` if the patch has
+    been (or was already) applied, ``False`` otherwise.
+    """
+    global _fused_swiglu_patched
+    if _fused_swiglu_patched:
+        return True
+    if not is_hunyuan_image3_fused_swiglu_enabled():
+        return False
+
+    try:
+        from vllm.model_executor.layers.activation import SiluAndMul
+    except Exception as e:  # pragma: no cover - depends on vLLM install
+        _log_swiglu(f"cannot import SiluAndMul: {e!r}")
+        return False
+
+    # Someone else (e.g. a future vllm-ascend version) may already provide the
+    # NPU forward; do not stack patches on top of it.
+    if getattr(SiluAndMul, "_omni_swiglu_patched", False):
+        _log_swiglu("SiluAndMul already patched by another module; skip")
+        _fused_swiglu_patched = True
+        return True
+
+    if not callable(getattr(torch_npu, "npu_swiglu", None)):
+        _log_swiglu("torch_npu.npu_swiglu unavailable; skip SwiGLU fusion")
+        return False
+
+    warn_holder = {"warned": False}
+
+    def _fused_swiglu_impl(x):
+        try:
+            return torch_npu.npu_swiglu(x)
+        except Exception as e:  # pragma: no cover - runtime fallback
+            if not warn_holder["warned"]:
+                _log_swiglu(f"npu_swiglu failed, fallback to native: {e!r}")
+                warn_holder["warned"] = True
+            d = x.shape[-1] // 2
+            import torch.nn.functional as F
+
+            return F.silu(x[..., :d]) * x[..., d:]
+
+    def forward_oot(self, x):
+        return _fused_swiglu_impl(x)
+
+    def forward(self, x):  # override CustomOp.forward for SiluAndMul
+        return _fused_swiglu_impl(x)
+
+    SiluAndMul._orig_forward_oot = SiluAndMul.forward_oot
+    SiluAndMul._orig_forward = SiluAndMul.forward
+    SiluAndMul.forward_oot = forward_oot
+    SiluAndMul.forward = forward  # <-- critical: 让已存在实例也立刻生效
+
+    # 覆盖当前进程里所有已存在的 SiluAndMul 实例的 _forward_method 快照
+    rebound = 0
+    try:
+        import gc
+
+        for obj in gc.get_objects():
+            if isinstance(obj, SiluAndMul):
+                # 绑定新的 forward_oot 到实例上，替换 __init__ 里存下的旧引用
+                try:
+                    obj._forward_method = forward_oot.__get__(obj, SiluAndMul)
+                    rebound += 1
+                except Exception:  # pragma: no cover - defensive
+                    pass
+    except Exception as e:  # pragma: no cover - defensive
+        _log_swiglu(f"failed to rebind existing SiluAndMul instances: {e!r}")
+
+    SiluAndMul._omni_swiglu_patched = True
+    _fused_swiglu_patched = True
+    _log_swiglu(
+        "patched SiluAndMul.forward/forward_oot -> npu_swiglu"
+        f" (rebound {rebound} existing instance(s))"
+    )
+    return True
+
+
+# Apply the patch at import time so it takes effect exactly like the previous
+# ``diffusion/patches/hunyuan_image3_fusion.py`` behavior.
+apply_hunyuan_image3_fused_swiglu_patch()
+
+
 __all__ = [
     "apply_hunyuan_image3_add_rms_norm_npu",
+    "apply_hunyuan_image3_fused_swiglu_patch",
     "apply_hunyuan_image3_rope_npu",
     "can_preexpand_hunyuan_image3_rope",
     "is_hunyuan_image3_fused_add_rms_norm_available",
     "is_hunyuan_image3_fused_add_rms_norm_enabled",
     "is_hunyuan_image3_fused_rope_available",
     "is_hunyuan_image3_fused_rope_enabled",
+    "is_hunyuan_image3_fused_swiglu_available",
+    "is_hunyuan_image3_fused_swiglu_enabled",
     "is_hunyuan_image3_rope_preexpand_enabled",
     "prepare_hunyuan_image3_rope_frequencies_npu",
 ]
