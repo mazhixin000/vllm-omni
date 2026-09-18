@@ -478,9 +478,24 @@ def test_model_forward_preexpands_once_and_shares_with_all_local_layers(
     monkeypatch.setattr(transformer_module, "get_sequence_parallel_world_size", lambda: 1)
 
     class RecordingLayer(nn.Module):
-        def forward(self, *, hidden_states, custom_pos_emb, **kwargs):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = nn.Identity()
+
+        def forward(
+            self,
+            *,
+            hidden_states,
+            custom_pos_emb,
+            precomputed_input_norm=None,
+            next_input_layernorm=None,
+            **kwargs,
+        ):
             del kwargs
             layer_inputs.append(custom_pos_emb)
+            cross_layer_norm = precomputed_input_norm is not None or next_input_layernorm is not None
+            if cross_layer_norm:
+                return hidden_states, hidden_states if next_input_layernorm is not None else None
             return (hidden_states,)
 
     model = transformer_module.HunyuanImage3Model.__new__(transformer_module.HunyuanImage3Model)
@@ -532,27 +547,15 @@ def test_model_level_rope_preexpand_leaves_non_image_path_unchanged(
     assert actual is custom_pos_emb
 
 
-# ``vllm_omni.diffusion.patches.hunyuan_image3_fusion`` replaces these methods at
-# import time with fused variants (DIT_FUSE_* env flags default to on). The unit
-# tests below cover the in-model implementations, so swap the saved originals
-# back for their duration.
-_PATCHED_METHODS = (
-    (transformer_module.HunYuanRotary2DEmbedder, "_prepare_cos_sin", "_orig_prepare_cos_sin"),
-    (transformer_module.HunYuanRotary2DEmbedder, "__call__", "_orig_call"),
-    (transformer_module.HunyuanImage3DecoderLayer, "forward", "_orig_forward"),
-)
+def test_model_optimizations_are_not_runtime_replaced():
+    """RoPE and AddRMSNorm have one implementation in the model source."""
+    assert not hasattr(transformer_module.HunYuanRotary2DEmbedder, "_orig_call")
+    assert not hasattr(transformer_module.HunYuanRotary2DEmbedder, "_orig_prepare_cos_sin")
+    assert not hasattr(transformer_module.HunyuanImage3DecoderLayer, "_orig_forward")
+    assert not hasattr(transformer_module, "_orig_build_batch_2d_rope")
 
 
-@pytest.fixture
-def in_model_hunyuan_image3(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Restore the un-patched in-model RoPE and decoder implementations."""
-    for cls, patched_attr, original_attr in _PATCHED_METHODS:
-        original = getattr(cls, original_attr, None)
-        if original is not None:
-            monkeypatch.setattr(cls, patched_attr, original, raising=False)
-
-
-def test_preexpanded_rope_requires_matching_rank(in_model_hunyuan_image3):
+def test_preexpanded_rope_requires_matching_rank():
     """A mixed half/full pair is rejected before stale state can be observed."""
     embedder = transformer_module.HunYuanRotary2DEmbedder(2, 1, 8)
     cos_full = torch.ones(1, 3, 1, 8)
@@ -568,7 +571,6 @@ def test_preexpanded_rope_requires_matching_rank(in_model_hunyuan_image3):
 
 def test_decoder_layer_uses_fused_add_rms_norm_residual(
     monkeypatch: pytest.MonkeyPatch,
-    in_model_hunyuan_image3,
 ) -> None:
     """The decoder must use the fused Add result as the MLP residual."""
     fused_calls = []
@@ -608,3 +610,69 @@ def test_decoder_layer_uses_fused_add_rms_norm_residual(
     assert residual is hidden_states
     torch.testing.assert_close(outputs[0], torch.full_like(hidden_states, 17))
     assert outputs[1:] == ("attention-weights", "present-key-value")
+
+
+def test_decoder_layers_fuse_cross_layer_add_rms_norm_without_persistent_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A layer returns the next norm result without storing request state on modules."""
+
+    class OffsetNorm(nn.Module):
+        def __init__(self, offset: float):
+            super().__init__()
+            self.offset = offset
+            self.calls = 0
+
+        def forward(self, hidden_states):
+            self.calls += 1
+            return hidden_states + self.offset
+
+    class Attention(nn.Module):
+        def forward(self, hidden_states, **kwargs):
+            del kwargs
+            return hidden_states + 1, "attention-weights", "present-key-value"
+
+    class MLP(nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states * 2
+
+    def add_rms_norm(norm, hidden_states, residual):
+        added = residual + hidden_states
+        return norm(added), added
+
+    def make_layer(input_offset: float, post_offset: float):
+        layer = transformer_module.HunyuanImage3DecoderLayer.__new__(
+            transformer_module.HunyuanImage3DecoderLayer
+        )
+        nn.Module.__init__(layer)
+        layer.input_layernorm = OffsetNorm(input_offset)
+        layer.post_attention_layernorm = OffsetNorm(post_offset)
+        layer.self_attn = Attention()
+        layer.mlp = MLP()
+        return layer
+
+    monkeypatch.setattr(transformer_module, "_apply_hunyuan_image3_add_rms_norm", add_rms_norm)
+    first = make_layer(10, 20)
+    second = make_layer(30, 40)
+    initial = torch.ones(1, 2, 4)
+
+    first_outputs = first(
+        initial,
+        output_attentions=True,
+        use_cache=True,
+        next_input_layernorm=second.input_layernorm,
+    )
+    second_outputs = second(
+        first_outputs[0],
+        precomputed_input_norm=first_outputs[-1],
+    )
+
+    torch.testing.assert_close(first_outputs[0], torch.full_like(initial, 79))
+    assert first_outputs[1:3] == ("attention-weights", "present-key-value")
+    torch.testing.assert_close(first_outputs[-1], torch.full_like(initial, 109))
+    torch.testing.assert_close(second_outputs[0], torch.full_like(initial, 647))
+    assert second_outputs[-1] is None
+    assert first.input_layernorm.calls == 1
+    assert second.input_layernorm.calls == 1
+    assert not hasattr(first, "_omni_input_normed")
+    assert not hasattr(second, "_omni_input_normed")

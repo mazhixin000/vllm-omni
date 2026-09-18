@@ -53,9 +53,9 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
         # metrics collected here; AiCoreNone produces traces without them.
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             export_type=torch_npu.profiler.ExportType.Text,
-            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+            profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
             msprof_tx=False,
-            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
             l2_cache=False,
             op_attr=False,
             data_simplification=True,

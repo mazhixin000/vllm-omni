@@ -35,7 +35,8 @@ Key optimizations over the original HuggingFace-style implementation:
 - Data parallel support for multi-GPU ViT inference
 """
 
-from collections.abc import Iterable
+import os
+from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn as nn
@@ -55,6 +56,23 @@ try:
     import torch_npu  # pyright: ignore[reportMissingImports]
 except ImportError:
     torch_npu = None
+
+
+_FUSED_VIT_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_VIT"
+_DISABLED_VALUES = frozenset({"0", "false", "no", "off", "disabled", "disable"})
+
+
+def is_hunyuan_image3_fused_vit_enabled() -> bool:
+    """Return whether HunyuanImage3 NPU ViT operator fusion is enabled."""
+    return os.environ.get(_FUSED_VIT_ENV, "").strip().lower() not in _DISABLED_VALUES
+
+
+def _get_hunyuan_image3_vit_npu_op(name: str) -> Callable[..., object] | None:
+    """Return an enabled torch-npu ViT operator, or ``None`` for fallback."""
+    if not is_hunyuan_image3_fused_vit_enabled() or torch_npu is None:
+        return None
+    op = getattr(torch_npu, name, None)
+    return op if callable(op) else None
 
 
 class Config:
@@ -203,9 +221,9 @@ class Siglip2Attention(nn.Module):
         )
         q, k, v = qkv.unbind(0)
 
-        if hidden_states.device.type == "npu" and cu_seqlens.numel() == 2:
-            assert torch_npu is not None
-            attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+        fused_attention = _get_hunyuan_image3_vit_npu_op("npu_fused_infer_attention_score")
+        if hidden_states.device.type == "npu" and cu_seqlens.numel() == 2 and fused_attention is not None:
+            attn_output, _ = fused_attention(
                 q.unsqueeze(0),
                 k.unsqueeze(0),
                 v.unsqueeze(0),
@@ -304,9 +322,9 @@ class Siglip2EncoderLayer(nn.Module):
         hidden_states = self.layer_norm1(hidden_states)
         hidden_states = self.self_attn(hidden_states, cu_seqlens=cu_seqlens)
 
-        if hidden_states.device.type == "npu":
-            assert torch_npu is not None
-            hidden_states, _, _, residual = torch_npu.npu_add_layer_norm(
+        fused_add_layer_norm = _get_hunyuan_image3_vit_npu_op("npu_add_layer_norm")
+        if hidden_states.device.type == "npu" and fused_add_layer_norm is not None:
+            hidden_states, _, _, residual = fused_add_layer_norm(
                 residual,
                 hidden_states,
                 self.layer_norm2.weight,
@@ -485,4 +503,5 @@ class LightProjector(nn.Module):
 __all__ = [
     "Siglip2VisionTransformer",
     "LightProjector",
+    "is_hunyuan_image3_fused_vit_enabled",
 ]

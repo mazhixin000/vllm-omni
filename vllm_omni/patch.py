@@ -487,16 +487,11 @@ _patch_cumem_free_callback_cuda()
 
 
 # =============================================================================
-# 模型级 monkey-patch 自动加载入口
+# 扩散模型平台补丁加载入口
 # =============================================================================
-# 把可选的、按模型隔离的运行时融合/替换补丁集中到
-# `vllm_omni/diffusion/patches/` 下，本文件只做一次触发式 import。
-#
-# 已注册的 patch：
-#   - hunyuan_image3_fusion : DiT RoPE Q/K / Add+RmsNorm / SwiGLU 融合
-#     开关环境变量：DIT_FUSE_ROPE_QK / DIT_FUSE_ADD_RMSNORM / DIT_FUSE_SWIGLU
-#
-# 加载失败一律 warn 后 fallthrough，不阻断 vllm_omni 主流程。
+# HunyuanImage3 的 RoPE、cos/sin、AddRMSNorm 与压缩 KV 已在模型和 NPU
+# 平台代码中直接实现。这里提前加载的模块只安装平台级 SwiGLU，并修复
+# vllm-ascend 的 MegaMoE 配置检查；可选 MegaMoE 模型补丁由模型包显式安装。
 def _load_diffusion_model_patches() -> None:
     try:
         from vllm_omni.diffusion.patches import hunyuan_image3_fusion  # noqa: F401

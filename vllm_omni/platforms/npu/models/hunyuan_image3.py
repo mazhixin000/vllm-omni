@@ -118,14 +118,11 @@ def prepare_hunyuan_image3_rope_frequencies_npu(
     dtype: torch.dtype,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Prepare HunyuanImage3 frequencies for fused BSND RoPE.
+    """Convert half-width HunyuanImage3 frequencies to fused BSND layout.
 
-    Hunyuan produces half-width ``[B, S, D/2]`` frequencies, while the Ascend
-    fused operator consumes ``[B, S, 1, D]``. A full-width ``[B, S, D]`` or
-    ``[B, S, 1, D]`` input is accepted as an idempotent fast path, allowing one
-    model-level expansion to be shared by every local decoder layer. That fast
-    path is what the runtime cos/sin sharing patch produces, so the two
-    optimizations compose instead of double-expanding.
+    The model calls this once after sequence-parallel sharding and shares the
+    resulting ``[B, S, 1, D]`` tensors across all local decoder layers. A 4-D
+    input is accepted so each layer can reuse that prepared pair without copying.
     """
     if cos.shape != sin.shape:
         raise ValueError(f"cos and sin must have identical shapes, got {cos.shape} and {sin.shape}")
@@ -137,19 +134,10 @@ def prepare_hunyuan_image3_rope_frequencies_npu(
         sin = sin.unsqueeze(0)
 
     if cos.ndim == 3:
-        if cos.shape[-1] == head_dim:
-            # Already full width: another caller (for example the runtime
-            # cos/sin sharing patch) expanded the pair once for every layer,
-            # so reuse it instead of duplicating the frequencies again.
-            cos = cos.unsqueeze(2)
-            sin = sin.unsqueeze(2)
-        elif cos.shape[-1] * 2 == head_dim:
-            cos = torch.cat((cos, cos), dim=-1).unsqueeze(2)
-            sin = torch.cat((sin, sin), dim=-1).unsqueeze(2)
-        else:
-            raise ValueError(
-                f"RoPE frequency width must be half of or equal to head_dim={head_dim}, got {cos.shape[-1]}"
-            )
+        if cos.shape[-1] * 2 != head_dim:
+            raise ValueError(f"RoPE frequency width must be half of head_dim={head_dim}, got {cos.shape[-1]}")
+        cos = torch.cat((cos, cos), dim=-1).unsqueeze(2)
+        sin = torch.cat((sin, sin), dim=-1).unsqueeze(2)
     elif cos.ndim == 4:
         if cos.shape[2] != 1 or cos.shape[-1] != head_dim:
             raise ValueError(f"Full-width RoPE frequencies must have shape [B, S, 1, {head_dim}], got {cos.shape}")

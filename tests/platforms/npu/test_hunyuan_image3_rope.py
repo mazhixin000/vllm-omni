@@ -217,7 +217,7 @@ def test_hunyuan_image3_rope_preexpand_switch_keeps_fused_qk_enabled(
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_prepare_hunyuan_image3_rope_frequencies_accepts_half_and_full_width(
+def test_prepare_hunyuan_image3_rope_frequencies_expands_once_and_reuses_prepared(
     monkeypatch: pytest.MonkeyPatch,
     batch_size: int,
 ) -> None:
@@ -259,26 +259,6 @@ def test_prepare_hunyuan_image3_rope_frequencies_accepts_half_and_full_width(
 
     assert reused_cos is cos_full
     assert reused_sin is sin_full
-
-    # The runtime cos/sin sharing patch expands the pair once for every layer
-    # and hands over a full-width ``[B, S, D]`` pair. That must be lifted to
-    # BSND without duplicating the frequencies a second time.
-    shared_cos = torch.cos(torch.randn(1, seq_len, head_dim))
-    shared_sin = torch.sin(torch.randn(1, seq_len, head_dim))
-    lifted_cos, lifted_sin = module.prepare_hunyuan_image3_rope_frequencies_npu(
-        shared_cos,
-        shared_sin,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        head_dim=head_dim,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-    )
-
-    assert lifted_cos.shape == (batch_size, seq_len, 1, head_dim)
-    torch.testing.assert_close(lifted_cos, shared_cos.expand(batch_size, -1, -1).unsqueeze(2))
-    torch.testing.assert_close(lifted_sin, shared_sin.expand(batch_size, -1, -1).unsqueeze(2))
-
 
 def test_preexpanded_frequencies_reach_fused_rope_without_cat(
     monkeypatch: pytest.MonkeyPatch,
@@ -359,7 +339,8 @@ def test_fused_rope_materializes_noncontiguous_packed_qk_views(
     ("cos_shape", "sin_shape", "error"),
     [
         ((1, 3, 4), (1, 4, 4), "identical shapes"),
-        ((1, 3, 5), (1, 3, 5), "half of or equal to head_dim"),
+        ((1, 3, 5), (1, 3, 5), "half of head_dim"),
+        ((1, 3, 8), (1, 3, 8), "half of head_dim"),
         ((1, 3, 2, 8), (1, 3, 2, 8), "Full-width"),
         ((1, 4, 4), (1, 4, 4), "sequence length mismatch"),
     ],

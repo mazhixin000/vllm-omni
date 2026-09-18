@@ -2092,6 +2092,8 @@ class HunyuanImage3DecoderLayer(nn.Module):
         output_attentions: bool | None = False,
         use_cache: bool | None = False,
         custom_pos_emb: tuple[torch.FloatTensor] | None = None,
+        precomputed_input_norm: torch.Tensor | None = None,
+        next_input_layernorm: RMSNorm | None = None,
         **kwargs,
     ) -> tuple[torch.FloatTensor | Any]:
         """
@@ -2110,7 +2112,11 @@ class HunyuanImage3DecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
             custom_pos_emb (`Tuple[torch.FloatTensor]`, *optional*): custom position embedding for rotary
-                position embedding
+                position embedding.
+            precomputed_input_norm (`torch.Tensor`, *optional*): input RMSNorm result produced by the
+                preceding decoder layer in the current model forward.
+            next_input_layernorm (`RMSNorm`, *optional*): next decoder layer's input norm, used to fuse
+                this layer's final residual add with the next layer's RMSNorm.
         """
         if "padding_mask" in kwargs:
             logger.warning(
@@ -2119,8 +2125,20 @@ class HunyuanImage3DecoderLayer(nn.Module):
             )
 
         residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
+        cross_layer_norm = precomputed_input_norm is not None or next_input_layernorm is not None
+        if precomputed_input_norm is None:
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            if precomputed_input_norm.shape != hidden_states.shape:
+                raise ValueError(
+                    "Precomputed input norm shape must match hidden states: "
+                    f"{precomputed_input_norm.shape} != {hidden_states.shape}"
+                )
+            if precomputed_input_norm.device != hidden_states.device:
+                raise ValueError("Precomputed input norm must be on the same device as hidden states")
+            if precomputed_input_norm.dtype != hidden_states.dtype:
+                raise ValueError("Precomputed input norm must have the same dtype as hidden states")
+            hidden_states = precomputed_input_norm
 
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -2132,11 +2150,9 @@ class HunyuanImage3DecoderLayer(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
-        # Fused Add+RMSNorm. When the runtime patch
-        # ``vllm_omni.diffusion.patches.hunyuan_image3_fusion`` is active it
-        # replaces this ``forward`` with an in-layer + cross-layer fused variant
-        # (DIT_FUSE_ADD_RMSNORM=1 by default), so this path acts as the
-        # in-model fallback.
+        # Fuse the post-attention residual add with RMSNorm on supported NPU
+        # platforms; other platforms and disabled configurations use the same
+        # model-level helper's separate Add + RMSNorm fallback.
         hidden_states, residual = _apply_hunyuan_image3_add_rms_norm(
             self.post_attention_layernorm,
             hidden_states,
@@ -2144,7 +2160,19 @@ class HunyuanImage3DecoderLayer(nn.Module):
         )
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+
+        # Fuse this layer's final residual add with the next layer's input
+        # RMSNorm. The normalized tensor is returned to the model loop as
+        # request-local state; it is never stored on either decoder layer.
+        next_input_norm = None
+        if next_input_layernorm is None:
+            hidden_states = residual + hidden_states
+        else:
+            next_input_norm, hidden_states = _apply_hunyuan_image3_add_rms_norm(
+                next_input_layernorm,
+                hidden_states,
+                residual,
+            )
 
         outputs = (hidden_states,)
 
@@ -2153,6 +2181,8 @@ class HunyuanImage3DecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
+        if cross_layer_norm:
+            outputs += (next_input_norm,)
 
         return outputs
 
@@ -2714,10 +2744,17 @@ class HunyuanImage3Model(nn.Module):
             self.rope_head_dim,
         )
 
+        # Carry the next layer's normalized input only inside this forward call.
+        # This preserves the public hidden-state semantics while allowing every
+        # local layer boundary to fuse residual Add + input RMSNorm safely.
+        precomputed_input_norm = None
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            next_layer = self.layers[layer_idx + 1] if layer_idx + 1 < len(self.layers) else None
+            next_input_layernorm = getattr(next_layer, "input_layernorm", None)
+            layer_uses_cross_norm = precomputed_input_norm is not None or next_input_layernorm is not None
             layer_outputs = decoder_layer(
                 positions=None,
                 hidden_states=hidden_states,
@@ -2727,6 +2764,8 @@ class HunyuanImage3Model(nn.Module):
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 custom_pos_emb=custom_pos_emb,
+                precomputed_input_norm=precomputed_input_norm,
+                next_input_layernorm=next_input_layernorm,
                 mode=mode,
                 first_step=first_step,
                 query_lens=query_lens,
@@ -2740,6 +2779,7 @@ class HunyuanImage3Model(nn.Module):
             )
 
             hidden_states = layer_outputs[0]
+            precomputed_input_norm = layer_outputs[-1] if layer_uses_cross_norm else None
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
