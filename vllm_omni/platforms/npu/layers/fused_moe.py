@@ -57,7 +57,7 @@ def _select_moe_comm_method(vllm_config: VllmConfig) -> MoECommType | None:
     elif soc_version in {AscendDeviceType._310P}:
         moe_comm_type = MoECommType.ALLGATHER
     elif soc_version in {AscendDeviceType.A5}:
-        moe_comm_type = MoECommType.ALLTOALL
+        moe_comm_type = MoECommType.ALLGATHER
     else:
         raise ValueError(f"Unsupported soc_version: {soc_version}")
     return moe_comm_type

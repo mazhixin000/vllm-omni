@@ -1,21 +1,36 @@
-# HunyuanImage-3.0-Instruct DiT-only deploy.
-#
-# Use this for standalone DiT/offline execution. This file resolves to one
-# diffusion stage with stage_id 0 and does not depend on the AR stage.
-# cfg_distilled/use_meanflow are detected from the checkpoint config. Keep
-# cfg_parallel_size=1 for cfg_distilled checkpoints.
+# HunyuanImage3 standalone DiT online test configuration for 4-card Ascend 950PR.
+# This snapshot stays with the test suite so the performance setup is reproducible.
 pipeline: hunyuan_image3_dit
 async_chunk: false
 
 stages:
   - stage_id: 0
     max_num_seqs: 1
-    gpu_memory_utilization: 0.65
+    gpu_memory_utilization: 0.9
     enforce_eager: true
     devices: "0,1,2,3"
-    # output_type: latent
     additional_config:
       multistream_overlap_shared_expert: true
+      hunyuan_vit_bucket_pad: true
+      hunyuan_vit_aclgraph: true
+      hunyuan_vit_aclgraph_strict: false
+      hunyuan_vit_aclgraph_lazy_capture: true
+      hunyuan_vit_aclgraph_warmups: 3
+      hunyuan_vit_aclgraph_max_graphs: 10
+      hunyuan_vit_aclgraph_dedicated_stream: true
+      hunyuan_vit_aclgraph_capture_layouts:
+        - batch_size: 1
+          max_patches: 1024
+          spatial_shapes:
+            - [42, 24]
+        - batch_size: 1
+          max_patches: 1024
+          spatial_shapes:
+            - [32, 24]
+        - batch_size: 1
+          max_patches: 1024
+          spatial_shapes:
+            - [24, 32]
     vae_use_slicing: false
     vae_use_tiling: true
     cache_backend:
@@ -45,30 +60,6 @@ platforms:
         gpu_memory_utilization: 0.65
         devices: "0,1,2,3"
         max_num_batched_tokens: 32768
-        additional_config:
-          hunyuan_vit_bucket_pad: false
-          hunyuan_vit_aclgraph: true
-          hunyuan_vit_aclgraph_strict: false
-          hunyuan_vit_aclgraph_lazy_capture: true
-          hunyuan_vit_aclgraph_warmups: 3
-          hunyuan_vit_aclgraph_max_graphs: 10
-          hunyuan_vit_aclgraph_dedicated_stream: true
-          hunyuan_vit_aclgraph_capture_layouts:
-            - batch_size: 1
-              max_patches: 1024
-              spatial_shapes:
-                - [42, 24]
-            - batch_size: 1
-              max_patches: 1024
-              spatial_shapes:
-                - [32, 24]
-            - batch_size: 1
-              max_patches: 1024
-              spatial_shapes:
-                - [24, 32]
-        # parallel_config:
-        #   tensor_parallel_size: 4
-        #   enable_expert_parallel: false
 
   xpu:
     stages:
@@ -80,7 +71,7 @@ platforms:
           pipeline_parallel_size: 1
           data_parallel_size: 1
           tensor_parallel_size: 8
-          enable_expert_parallel: true
+          enable_expert_parallel: false
           sequence_parallel_size: 1
           ulysses_degree: 1
           ring_degree: 1
