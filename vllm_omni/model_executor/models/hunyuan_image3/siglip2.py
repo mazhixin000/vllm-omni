@@ -59,12 +59,25 @@ except ImportError:
 
 
 _FUSED_VIT_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_VIT"
+_VIT_DATA_PARALLEL_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_VIT_DATA_PARALLEL"
 _DISABLED_VALUES = frozenset({"0", "false", "no", "off", "disabled", "disable"})
 
 
 def is_hunyuan_image3_fused_vit_enabled() -> bool:
     """Return whether HunyuanImage3 NPU ViT operator fusion is enabled."""
     return os.environ.get(_FUSED_VIT_ENV, "").strip().lower() not in _DISABLED_VALUES
+
+
+def is_hunyuan_image3_vit_data_parallel_enabled() -> bool:
+    """Return whether the HunyuanImage3 ViT runs in data-parallel mode.
+
+    Enabled by default: the ViT linear layers are built with ``disable_tp=True``
+    so every rank keeps a full replica of the weights and the ViT is executed
+    data-parallel across the TP group. Set
+    ``VLLM_OMNI_HUNYUAN_IMAGE3_VIT_DATA_PARALLEL=0`` before starting the process
+    to shard the ViT over the model tensor-parallel group instead.
+    """
+    return os.environ.get(_VIT_DATA_PARALLEL_ENV, "").strip().lower() not in _DISABLED_VALUES
 
 
 def _get_hunyuan_image3_vit_npu_op(name: str) -> Callable[..., object] | None:
@@ -168,8 +181,7 @@ class Siglip2Attention(nn.Module):
         self.head_dim = self.embed_dim // self.num_heads
         self.scale = self.head_dim**-0.5
 
-        # use_data_parallel = is_vit_use_data_parallel()
-        use_data_parallel = True
+        use_data_parallel = is_hunyuan_image3_vit_data_parallel_enabled()
         self.qkv_proj = QKVParallelLinear(
             hidden_size=self.embed_dim,
             head_size=self.head_dim,
@@ -261,8 +273,7 @@ class Siglip2MLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        # use_data_parallel = is_vit_use_data_parallel()
-        use_data_parallel = True
+        use_data_parallel = is_hunyuan_image3_vit_data_parallel_enabled()
         self.activation_fn = get_act_fn(config.hidden_act)
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
