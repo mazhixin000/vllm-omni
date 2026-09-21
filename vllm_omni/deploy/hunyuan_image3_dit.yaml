@@ -18,6 +18,7 @@ stages:
       hunyuan_vit_aclgraph_warmups: 3
       hunyuan_vit_aclgraph_max_graphs: 10
       hunyuan_vit_aclgraph_dedicated_stream: true
+      hunyuan_vit_aclgraph_add_layer_norm: true
       hunyuan_vit_aclgraph_capture_layouts:
         - batch_size: 1
           max_patches: 1024

@@ -21,6 +21,8 @@ encoder + post layernorm），动态的 pack / unpack、aligner、prompt scatter
   hunyuan_vit_aclgraph_dedicated_stream 使用独立 stream 捕获/回放
   hunyuan_vit_aclgraph_capture_layouts  预捕获 layout 列表
   hunyuan_vit_bucket_pad                预处理阶段把 ViT 输入 pad 到固定桶
+  hunyuan_vit_aclgraph_add_layer_norm   图模式下是否保留 npu_add_layer_norm
+                                        融合算子（auto=启动期探测，1=强制开，0=强制关）
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ import builtins
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -82,6 +84,9 @@ class HunyuanImage3VitGraphKey:
     model_dtype: torch.dtype
     device_index: int
     attention_backend: str
+    # 图内容取决于编码器里走的是融合的 Add+LayerNorm 还是原生 add + nn.LayerNorm，
+    # 两者不能共用同一张图，因此必须进 key。
+    add_layer_norm: bool
 
 
 @dataclass
@@ -93,6 +98,8 @@ class HunyuanImage3VitGraphConfig:
     max_graphs: int = 8
     capture_layouts: tuple[Siglip2GraphLayout, ...] = ()
     use_dedicated_stream: bool = True
+    # None => auto：启动期用一次迷你图捕获探测后决定。
+    fused_add_layer_norm: bool | None = None
 
     @staticmethod
     def parse_bool(value: Any, default: bool = False) -> bool:
@@ -105,6 +112,15 @@ class HunyuanImage3VitGraphConfig:
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "y", "on"}
         return default
+
+    @staticmethod
+    def parse_optional_bool(value: Any) -> bool | None:
+        """Parse a tri-state switch: ``True``/``False``，``None`` 表示 auto。"""
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip().lower() in {"", "auto", "default"}:
+            return None
+        return HunyuanImage3VitGraphConfig.parse_bool(value, True)
 
     @staticmethod
     def parse_int(value: Any, default: int) -> int:
@@ -185,6 +201,7 @@ class HunyuanImage3VitGraphConfig:
             max_graphs=max(0, cls.parse_int(config.get("hunyuan_vit_aclgraph_max_graphs"), 8)),
             capture_layouts=tuple(layouts),
             use_dedicated_stream=cls.parse_bool(config.get("hunyuan_vit_aclgraph_dedicated_stream"), True),
+            fused_add_layer_norm=cls.parse_optional_bool(config.get("hunyuan_vit_aclgraph_add_layer_norm")),
         )
 
 
@@ -521,6 +538,7 @@ class HunyuanImage3VitAclGraphManager:
             model_dtype=model_dtype,
             device_index=int(device_index),
             attention_backend=attention_backend,
+            add_layer_norm=is_vit_graph_fused_add_layer_norm_enabled(),
         )
 
     def _validate_supported(self, prepared: Siglip2PreparedGraphInputs) -> str | None:
@@ -556,82 +574,101 @@ class HunyuanImage3VitAclGraphManager:
                 self._disabled[key] = reason
                 raise RuntimeError(reason)
 
-            static_packed_pixels = torch.empty_like(prepared.packed_pixels)
-            static_position_embeddings = prepared.packed_position_embeddings.detach().clone()
-            static_cu_seqlens = prepared.cu_seqlens.detach().clone()
-            stream = self._new_stream(self.device) if self.config.use_dedicated_stream else self._current_stream()
-            current_stream = self._current_stream()
-
-            start = time.perf_counter()
-            static_output = None
             try:
-                self._wait_stream(stream, current_stream)
-                with torch.npu.stream(stream):
-                    static_packed_pixels.copy_(prepared.packed_pixels, non_blocking=True)
-                    for _ in range(self.config.warmups):
+                return self._capture_layout(prepared, key)
+            except Exception as exc:  # noqa: BLE001
+                reason = str(exc) or type(exc).__name__
+                # 探测通过但真实捕获仍失败时，关掉融合的 Add+LayerNorm 并用原生路径重试
+                # 一次。只有在一张图都还没捕获成功时才允许切换，避免新旧图混用两套 kernel。
+                if not self._graphs and _turn_off_vit_graph_fused_add_layer_norm_on_failure(reason):
+                    retry_key = self.prepare_key(prepared)
+                    try:
+                        return self._capture_layout(prepared, retry_key)
+                    except Exception as retry_exc:  # noqa: BLE001
+                        self._disabled[retry_key] = str(retry_exc) or type(retry_exc).__name__
+                        raise
+                self._disabled[key] = reason
+                raise
+
+    @torch.inference_mode()
+    def _capture_layout(
+        self,
+        prepared: Siglip2PreparedGraphInputs,
+        key: HunyuanImage3VitGraphKey,
+    ) -> HunyuanImage3VitGraphEntry:
+        static_packed_pixels = torch.empty_like(prepared.packed_pixels)
+        static_position_embeddings = prepared.packed_position_embeddings.detach().clone()
+        static_cu_seqlens = prepared.cu_seqlens.detach().clone()
+        stream = self._new_stream(self.device) if self.config.use_dedicated_stream else self._current_stream()
+        current_stream = self._current_stream()
+
+        start = time.perf_counter()
+        static_output = None
+        try:
+            self._wait_stream(stream, current_stream)
+            with torch.npu.stream(stream):
+                static_packed_pixels.copy_(prepared.packed_pixels, non_blocking=True)
+                for _ in range(self.config.warmups):
+                    static_output = self.graph_forward(
+                        static_packed_pixels,
+                        static_position_embeddings,
+                        static_cu_seqlens,
+                    )
+                stream.synchronize()
+
+                graph = torch.npu.NPUGraph()
+                if self._pool is None:
+                    with torch.npu.graph(graph):
                         static_output = self.graph_forward(
                             static_packed_pixels,
                             static_position_embeddings,
                             static_cu_seqlens,
                         )
-                    stream.synchronize()
+                else:
+                    with torch.npu.graph(graph, pool=self._pool):
+                        static_output = self.graph_forward(
+                            static_packed_pixels,
+                            static_position_embeddings,
+                            static_cu_seqlens,
+                        )
+                replay_done_event = self._record_event(stream)
+            self._wait_stream(current_stream, stream)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("HunyuanImage3 ViT NPUGraph capture failed for key=%s: %s", key, exc)
+            raise
 
-                    graph = torch.npu.NPUGraph()
-                    if self._pool is None:
-                        with torch.npu.graph(graph):
-                            static_output = self.graph_forward(
-                                static_packed_pixels,
-                                static_position_embeddings,
-                                static_cu_seqlens,
-                            )
-                    else:
-                        with torch.npu.graph(graph, pool=self._pool):
-                            static_output = self.graph_forward(
-                                static_packed_pixels,
-                                static_position_embeddings,
-                                static_cu_seqlens,
-                            )
-                    replay_done_event = self._record_event(stream)
-                self._wait_stream(current_stream, stream)
-            except Exception as exc:  # noqa: BLE001
-                reason = str(exc) or type(exc).__name__
-                self._disabled[key] = reason
-                raise
+        if static_output is None:
+            raise RuntimeError("capture produced no output")
 
-            if static_output is None:
-                reason = "capture produced no output"
-                self._disabled[key] = reason
-                raise RuntimeError(reason)
-
-            capture_time_ms = (time.perf_counter() - start) * 1000.0
-            memory_bytes = (
-                static_packed_pixels.numel() * static_packed_pixels.element_size()
-                + static_position_embeddings.numel() * static_position_embeddings.element_size()
-                + static_cu_seqlens.numel() * static_cu_seqlens.element_size()
-                + static_output.numel() * static_output.element_size()
-            )
-            entry = HunyuanImage3VitGraphEntry(
-                key=key,
-                graph=graph,
-                static_packed_pixels=static_packed_pixels,
-                static_position_embeddings=static_position_embeddings,
-                static_cu_seqlens=static_cu_seqlens,
-                static_output=static_output,
-                stream=stream,
-                replay_done_event=replay_done_event,
-                capture_time_ms=capture_time_ms,
-                memory_bytes=memory_bytes,
-            )
-            self._graphs[key] = entry
-            self._stats["capture_count"] += 1
-            self._stats["capture_time_ms"] += capture_time_ms
-            logger.info(
-                "Captured HunyuanImage3 ViT NPUGraph key=%s in %.2f ms (static buffers %.2f MiB).",
-                key,
-                capture_time_ms,
-                memory_bytes / (1024**2),
-            )
-            return entry
+        capture_time_ms = (time.perf_counter() - start) * 1000.0
+        memory_bytes = (
+            static_packed_pixels.numel() * static_packed_pixels.element_size()
+            + static_position_embeddings.numel() * static_position_embeddings.element_size()
+            + static_cu_seqlens.numel() * static_cu_seqlens.element_size()
+            + static_output.numel() * static_output.element_size()
+        )
+        entry = HunyuanImage3VitGraphEntry(
+            key=key,
+            graph=graph,
+            static_packed_pixels=static_packed_pixels,
+            static_position_embeddings=static_position_embeddings,
+            static_cu_seqlens=static_cu_seqlens,
+            static_output=static_output,
+            stream=stream,
+            replay_done_event=replay_done_event,
+            capture_time_ms=capture_time_ms,
+            memory_bytes=memory_bytes,
+        )
+        self._graphs[key] = entry
+        self._stats["capture_count"] += 1
+        self._stats["capture_time_ms"] += capture_time_ms
+        logger.info(
+            "Captured HunyuanImage3 ViT NPUGraph key=%s in %.2f ms (static buffers %.2f MiB).",
+            key,
+            capture_time_ms,
+            memory_bytes / (1024**2),
+        )
+        return entry
 
     @torch.inference_mode()
     def execute_padded(self, prepared: Siglip2PreparedGraphInputs) -> torch.Tensor:
@@ -725,46 +762,200 @@ class HunyuanImage3VitAclGraphManager:
             "disabled_count": len(self._disabled),
             "keys": [str(key) for key in self._graphs],
             "disabled": {str(key): reason for key, reason in self._disabled.items()},
+            "fused_add_layer_norm": vit_graph_fused_add_layer_norm_state(),
         }
 
 
 # =============================================================================
-# SigLIP2 融合算子在 ACL graph 下的降级（patch，不改 siglip2.py 源码）
+# SigLIP2 融合算子在 ACL graph 下的取舍（patch，不改 siglip2.py 源码）
 # =============================================================================
 # siglip2.py 里 ``npu_fused_infer_attention_score`` / ``npu_add_layer_norm``
 # 两条融合路径由 ``_get_hunyuan_image3_vit_npu_op`` 统一取算子（并由
-# VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_VIT 控制）。
+# VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_VIT 控制）。图模式下能否保留，取决于它能否被
+# ACL graph 捕获：
 #
-# 只有 ``npu_add_layer_norm`` 需要在图模式下降级：它对 packed 输入的处理会引入
-# 非静态 shape，无法被捕获。
+# - ``npu_fused_infer_attention_score``：不能降级。降级后 SigLIP2 会改走
+#   ``MMEncoderAttention`` 的 varlen 路径，而 NPU 上的 Ascend 实现（不在 vllm-ascend
+#   的 encoder graph 上下文中时会走 ``_forward_eager_fia``）需要先把 cu_seqlens 拷回
+#   host、再以 host 侧 actual_seq_lengths 调用 FIA，捕获期间这一来一回都会触发
+#   ``aclrtMemcpy: stream is captured``，导致 ViT 图全部捕获失败并永久回退 eager
+#   （实测 3 张参考图 100ms 而非图模式的 ~20ms）。融合分支在 batch=1 时走 BSND
+#   全注意力，完全不接触 cu_seqlens，是静态可捕获的。
+# - ``npu_add_layer_norm``：以前是一律降级（它曾对 packed 输入引入非静态 shape）。
+#   现在改为**启动期探测**：用静态 buffer 走一次「warmup + 迷你图捕获 + replay」，
+#   能捕获就保留融合实现（省掉一次 residual add kernel 与 LayerNorm 的额外读写），
+#   不能捕获才降级成原生 ``add + nn.LayerNorm``。可用
+#   ``hunyuan_vit_aclgraph_add_layer_norm`` 强制 1/0/auto。
 #
-# ``npu_fused_infer_attention_score`` 不能降级。降级后 SigLIP2 会改走
-# ``MMEncoderAttention`` 的 varlen 路径，而 NPU 上的 Ascend 实现（不在 vllm-ascend
-# 的 encoder graph 上下文中时会走 ``_forward_eager_fia``）需要先把 cu_seqlens 拷回
-# host、再以 host 侧 actual_seq_lengths 调用 FIA，捕获期间这一来一回都会触发
-# ``aclrtMemcpy: stream is captured``，导致 ViT 图全部捕获失败并永久回退 eager
-# （实测 3 张参考图 100ms 而非图模式的 ~20ms）。融合分支在 batch=1 时走 BSND
-# 全注意力，完全不接触 cu_seqlens，是静态可捕获的。
+# 探测结论不是最终保证：真实捕获若因该算子失败，且此时还没有任何已捕获的图，
+# 会自动关掉它并用原生路径重试一次，避免所有 layout 被一次性打进黑名单。
 
 _VIT_GRAPH_ACTIVE = False
+_VIT_GRAPH_FUSED_ADD_LAYER_NORM = False
+_VIT_GRAPH_ADD_LAYER_NORM_REASON = "not evaluated"
+
+_GRAPH_SAFE_FUSED_OPS = frozenset({"npu_fused_infer_attention_score"})
+_ADD_LAYER_NORM_OP = "npu_add_layer_norm"
+_ORIGINAL_GET_VIT_NPU_OP: Callable[[str], Callable[..., object] | None] | None = None
 
 
 def _patch_siglip2_graph_friendly_ops() -> None:
-    """Make SigLIP2 fall back to non-fused kernels while ACL graph mode is on."""
+    """Route SigLIP2's fused operators according to ACL graph capture support.
+
+    安装后 ``_VIT_GRAPH_ACTIVE`` 仍为 False 时等价于透传，因此可以先装 hook、
+    再探测算子、最后才激活图模式。
+    """
     from vllm_omni.model_executor.models.hunyuan_image3 import siglip2
+
+    global _ORIGINAL_GET_VIT_NPU_OP
 
     if getattr(siglip2, "_omni_vit_graph_ops_patched", False):
         return
 
     original_get_op = siglip2._get_hunyuan_image3_vit_npu_op
+    _ORIGINAL_GET_VIT_NPU_OP = original_get_op
 
     def _get_hunyuan_image3_vit_npu_op(name: str):
-        if _VIT_GRAPH_ACTIVE and name != "npu_fused_infer_attention_score":
+        if _VIT_GRAPH_ACTIVE:
+            if name in _GRAPH_SAFE_FUSED_OPS:
+                return original_get_op(name)
+            if name == _ADD_LAYER_NORM_OP and _VIT_GRAPH_FUSED_ADD_LAYER_NORM:
+                return original_get_op(name)
             return None
         return original_get_op(name)
 
     siglip2._get_hunyuan_image3_vit_npu_op = _get_hunyuan_image3_vit_npu_op
     siglip2._omni_vit_graph_ops_patched = True
+
+
+def _set_vit_graph_fused_add_layer_norm(allowed: bool, reason: str) -> None:
+    global _VIT_GRAPH_FUSED_ADD_LAYER_NORM, _VIT_GRAPH_ADD_LAYER_NORM_REASON
+    _VIT_GRAPH_FUSED_ADD_LAYER_NORM = bool(allowed)
+    _VIT_GRAPH_ADD_LAYER_NORM_REASON = reason
+
+
+def is_vit_graph_fused_add_layer_norm_enabled() -> bool:
+    """Return whether the fused Add+LayerNorm stays enabled inside the ViT graph."""
+    return _VIT_GRAPH_FUSED_ADD_LAYER_NORM
+
+
+def vit_graph_fused_add_layer_norm_state() -> dict[str, Any]:
+    """Expose the Add+LayerNorm decision for logging and ``stats()``."""
+    return {
+        "operator": _ADD_LAYER_NORM_OP,
+        "enabled": _VIT_GRAPH_FUSED_ADD_LAYER_NORM,
+        "reason": _VIT_GRAPH_ADD_LAYER_NORM_REASON,
+    }
+
+
+def _turn_off_vit_graph_fused_add_layer_norm_on_failure(reason: str) -> bool:
+    """Disable the fused operator after a capture failure.
+
+    Returns ``True`` only when it was enabled and has just been switched off,
+    i.e. when a capture retry with the native path makes sense.
+    """
+    if not _VIT_GRAPH_FUSED_ADD_LAYER_NORM:
+        return False
+    _set_vit_graph_fused_add_layer_norm(False, f"disabled after capture failure: {reason}")
+    logger.warning(
+        "HunyuanImage3 ViT NPUGraph turned off %s because a graph capture failed (%s); "
+        "retrying with the native add + LayerNorm path.",
+        _ADD_LAYER_NORM_OP,
+        reason,
+    )
+    return True
+
+
+@torch.inference_mode()
+def _probe_fused_add_layer_norm(
+    fused_add_layer_norm: Callable[..., object],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    hidden_size: int,
+    token_count: int = 64,
+    epsilon: float = 1e-6,
+    warmups: int = 1,
+) -> str | None:
+    """Return ``None`` when the fused op can be captured, otherwise the reason.
+
+    探测用一张一次性的迷你 NPUGraph 完成：静态 buffer 上先 warmup，再尝试捕获并
+    replay。任何异常（典型是算子内部触发 host 回读导致的
+    ``aclrtMemcpy: stream is captured``）都视为不可入图。
+    """
+    manager_cls = HunyuanImage3VitAclGraphManager
+    if not manager_cls._npu_graph_available():
+        return "torch.npu.NPUGraph is unavailable"
+
+    outputs: Any = None
+    try:
+        x1 = torch.zeros((token_count, hidden_size), dtype=dtype, device=device)
+        x2 = torch.zeros_like(x1)
+        gamma = torch.ones(hidden_size, dtype=dtype, device=device)
+        beta = torch.zeros(hidden_size, dtype=dtype, device=device)
+
+        stream = manager_cls._new_stream(device)
+        current_stream = manager_cls._current_stream()
+        manager_cls._wait_stream(stream, current_stream)
+        with torch.npu.stream(stream):
+            for _ in range(max(0, warmups)):
+                fused_add_layer_norm(x1, x2, gamma, beta, epsilon, True)
+            stream.synchronize()
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph):
+                outputs = fused_add_layer_norm(x1, x2, gamma, beta, epsilon, True)
+            graph.replay()
+        manager_cls._wait_stream(current_stream, stream)
+    except Exception as exc:  # noqa: BLE001
+        # 探测图随局部变量一起释放，不占用图池显存。
+        return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+    if not isinstance(outputs, tuple) or len(outputs) < 4:
+        return f"unexpected {_ADD_LAYER_NORM_OP} output signature: {type(outputs).__name__}"
+    return None
+
+
+def _resolve_vit_graph_fused_add_layer_norm(
+    vision_model: Any,
+    config: HunyuanImage3VitGraphConfig,
+    device: torch.device,
+) -> None:
+    """Decide whether the fused Add+LayerNorm may stay enabled in graph mode."""
+    if config.fused_add_layer_norm is False:
+        _set_vit_graph_fused_add_layer_norm(False, "disabled by hunyuan_vit_aclgraph_add_layer_norm")
+        return
+    if _ORIGINAL_GET_VIT_NPU_OP is None:
+        _set_vit_graph_fused_add_layer_norm(False, "SigLIP2 operator hook is not installed")
+        return
+
+    fused_add_layer_norm = _ORIGINAL_GET_VIT_NPU_OP(_ADD_LAYER_NORM_OP)
+    if fused_add_layer_norm is None:
+        _set_vit_graph_fused_add_layer_norm(
+            False,
+            f"{_ADD_LAYER_NORM_OP} unavailable (VLLM_OMNI_HUNYUAN_IMAGE3_FUSED_VIT off or torch-npu too old)",
+        )
+        return
+    if config.fused_add_layer_norm is True:
+        _set_vit_graph_fused_add_layer_norm(True, "forced on by hunyuan_vit_aclgraph_add_layer_norm")
+        return
+
+    hidden_size = int(getattr(vision_model, "embed_dim", 0) or 0)
+    if hidden_size <= 0:
+        _set_vit_graph_fused_add_layer_norm(False, "unknown ViT hidden size")
+        return
+
+    reason = _probe_fused_add_layer_norm(
+        fused_add_layer_norm,
+        device=device,
+        dtype=next(vision_model.parameters()).dtype,
+        hidden_size=hidden_size,
+        epsilon=float(getattr(getattr(vision_model, "config", None), "layer_norm_eps", 1e-6) or 1e-6),
+        warmups=config.warmups,
+    )
+    if reason is None:
+        _set_vit_graph_fused_add_layer_norm(True, "capture probe succeeded")
+    else:
+        _set_vit_graph_fused_add_layer_norm(False, f"capture probe failed: {reason}")
 
 
 # =============================================================================
@@ -919,9 +1110,22 @@ def _ensure_vit_graph_manager(self):
             logger.info("HunyuanImage3 ViT NPUGraph disabled because ViT data parallel is off.")
             return None
 
-        # 图模式激活：把 SigLIP2 的融合算子降级为原生实现，保证可捕获。
-        _VIT_GRAPH_ACTIVE = True
+        # 先装算子 hook（此时 _VIT_GRAPH_ACTIVE 仍为 False，等价于透传），再决定
+        # Add+LayerNorm 能否入图，最后才激活图模式。
         _patch_siglip2_graph_friendly_ops()
+        _resolve_vit_graph_fused_add_layer_norm(
+            self.vision_model,
+            HunyuanImage3VitGraphConfig.from_mapping(
+                getattr(self.od_config, "additional_config", {}) or {},
+                getattr(self.vision_model, "config", None),
+            ),
+            device,
+        )
+        logger.info(
+            "HunyuanImage3 ViT NPUGraph fused Add+LayerNorm: %s",
+            vit_graph_fused_add_layer_norm_state(),
+        )
+        _VIT_GRAPH_ACTIVE = True
 
         self._vit_graph_init_attempted = True
         manager = HunyuanImage3VitAclGraphManager.from_od_config(self.vision_model, self.od_config, device)
@@ -1073,4 +1277,6 @@ __all__ = [
     "Siglip2GraphLayout",
     "Siglip2PreparedGraphInputs",
     "apply_hunyuan_image3_vit_graph_patch",
+    "is_vit_graph_fused_add_layer_norm_enabled",
+    "vit_graph_fused_add_layer_norm_state",
 ]
