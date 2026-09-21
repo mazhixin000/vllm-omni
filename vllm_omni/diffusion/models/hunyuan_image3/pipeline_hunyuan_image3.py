@@ -26,6 +26,7 @@ from vllm.transformers_utils.config import get_config
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import _hy3_dump, _hy3_set_active
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
@@ -1319,13 +1320,19 @@ class HunyuanImage3Pipeline(
 
     def ragged_final_layer(self, x, image_mask, timestep, token_h, token_w, first_step):
         bsz, seq_len, n_embd = x.shape
+        _hy3_dump("ragged.in.x", x)
+        _hy3_dump("ragged.in.image_mask", image_mask)
+        _hy3_dump("ragged.in.timestep", timestep)
         if first_step:
             image_output = x.masked_select(image_mask.unsqueeze(-1).bool()).reshape(bsz, -1, n_embd)
         else:
             dynamic_token_count = 1 + int(self.cfg_distilled) + int(self.use_meanflow)
             image_output = x[:, dynamic_token_count:, :]
+        _hy3_dump("ragged.image_output", image_output)
         timestep_emb = self.time_embed_2(timestep)
+        _hy3_dump("ragged.timestep_emb", timestep_emb)
         pred = self.final_layer(image_output, timestep_emb, token_h, token_w)
+        _hy3_dump("ragged.pred", pred)
         return pred
 
     @staticmethod
@@ -2716,7 +2723,24 @@ class HunyuanImage3Pipeline(
         generator: torch.Generator | list[torch.Generator] | None = None,
         **kwargs,
     ) -> DiffusionOutput:
+        # -------- HY3 DUMP: pipeline.forward inputs (raw request) --------
+        _req_id = getattr(req, "request_id", None)
+        _hy3_set_active(is_dummy=(isinstance(_req_id, str) and "dummy" in _req_id.lower()))
+        _hy3_dump("pipeline.req.request_id", _req_id)
+        _hy3_dump("pipeline.req.prompts", getattr(req, "prompts", None))
+        _hy3_dump(
+            "pipeline.req.sampling_params",
+            repr(getattr(req, "sampling_params", None))[:1024],
+        )
+        _hy3_dump("pipeline.arg.prompt", prompt)
+        _hy3_dump("pipeline.arg.image_size", image_size)
+        _hy3_dump("pipeline.arg.height", height)
+        _hy3_dump("pipeline.arg.width", width)
+        _hy3_dump("pipeline.arg.num_inference_steps", num_inference_steps)
+        _hy3_dump("pipeline.arg.guidance_scale", guidance_scale)
+
         extra_args = getattr(getattr(req, "sampling_params", None), "extra_args", {}) or {}
+        _hy3_dump("pipeline.extra_args", extra_args)
         (
             prompt_from_req,
             cot_text_list,
@@ -2729,14 +2753,38 @@ class HunyuanImage3Pipeline(
             request_id=req.request_id,
             allow_cond_image=True,
         )
+        # -------- HY3 DUMP: after _extract_prompt_inputs --------
+        _hy3_dump("pipeline.extracted.prompt_from_req", prompt_from_req)
+        _hy3_dump("pipeline.extracted.cot_text_list", cot_text_list)
+        _hy3_dump("pipeline.extracted.system_prompt", system_prompt)
+        _hy3_dump(
+            "pipeline.extracted.batch_cond_image_info_summary",
+            {
+                "num_batches": len(batch_cond_image_info) if batch_cond_image_info else 0,
+                "per_batch_num_images": [
+                    len(x) if x is not None else 0 for x in (batch_cond_image_info or [])
+                ],
+            },
+        )
+        _hy3_dump("pipeline.extracted.tokenizer_bot_task", tokenizer_bot_task)
+
         prompt = prompt_from_req or prompt
         cot_text = (
             [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
         )
+        _hy3_dump("pipeline.processed.cot_text", cot_text)
+
         batch_external_cond_vae_images, external_cond_timestep_chunks = self._extract_external_condition_inputs(
             extra_args,
             batch_cond_image_info,
         )
+        _hy3_dump(
+            "pipeline.external_cond_vae_images_summary",
+            {
+                "num_batches": len(batch_external_cond_vae_images) if batch_external_cond_vae_images else 0,
+            },
+        )
+        _hy3_dump("pipeline.external_cond_timestep_chunks", external_cond_timestep_chunks)
 
         generator = req.sampling_params.generator or generator
         infer_align_image_size = bool(extra_args.get("infer_align_image_size", False))
@@ -2749,9 +2797,25 @@ class HunyuanImage3Pipeline(
         if guidance_scale <= 1.0:
             logger.info("HunyuanImage3.0 runs without classifier-free guidance when guidance_scale <= 1.0.")
         image_size = (height, width)
+        _hy3_dump("pipeline.resolved.image_size", image_size)
+        _hy3_dump("pipeline.resolved.num_inference_steps", num_inference_steps)
+        _hy3_dump("pipeline.resolved.guidance_scale", guidance_scale)
 
         # ---- AR KV Reuse: extract injected KV from request ----
         ar_kv_kwargs = self._extract_ar_kv_from_request(req)
+        # AR-KV 可能是巨大的多层 kv cache——只 dump 摘要
+        _ar_kv_summary = None
+        if ar_kv_kwargs and "ar_kv_data" in ar_kv_kwargs:
+            _ar_kv = ar_kv_kwargs["ar_kv_data"]
+            if _ar_kv:
+                _first = next(iter(_ar_kv.values()))
+                _ar_kv_summary = {
+                    "num_layers": len(_ar_kv),
+                    "key_shape": list(_first["key"].shape) if hasattr(_first["key"], "shape") else None,
+                    "value_shape": list(_first["value"].shape) if hasattr(_first["value"], "shape") else None,
+                    "key_dtype": str(_first["key"].dtype) if hasattr(_first["key"], "dtype") else None,
+                }
+        _hy3_dump("pipeline.ar_kv_kwargs_summary", _ar_kv_summary)
 
         model_inputs = self.prepare_model_inputs(
             prompt=prompt,
@@ -2771,8 +2835,78 @@ class HunyuanImage3Pipeline(
 
         model_inputs.update(ar_kv_kwargs)
 
+        # -------- HY3 DUMP: prepare_model_inputs 关键张量输出 --------
+        _hy3_dump("pipeline.model_inputs.keys", list(model_inputs.keys()))
+        for _k in (
+            "input_ids",
+            "position_ids",
+            "image_mask",
+            "gen_timestep_scatter_index",
+            "guidance_scatter_index",
+            "timestep_r_scatter_index",
+            "cond_vae_images",
+            "cond_timestep",
+            "cond_vae_image_mask",
+            "cond_vit_images",
+            "cond_vit_image_mask",
+            "cond_timestep_scatter_index",
+        ):
+            if _k in model_inputs:
+                _hy3_dump(f"pipeline.model_inputs.{_k}", model_inputs[_k])
+        # custom_pos_emb 是 (cos, sin) tuple
+        _cpe = model_inputs.get("custom_pos_emb")
+        if _cpe is not None and isinstance(_cpe, (tuple, list)) and len(_cpe) >= 2:
+            _hy3_dump("pipeline.model_inputs.custom_pos_emb.cos", _cpe[0])
+            _hy3_dump("pipeline.model_inputs.custom_pos_emb.sin", _cpe[1])
+        # tokenizer_output 内部结构（gen_image_slices / joint_image_slices / real_pos / gen_image_mask 等）
+        _tok = model_inputs.get("tokenizer_output")
+        if _tok is not None:
+            _hy3_dump(
+                "pipeline.tokenizer_output.summary",
+                {
+                    "joint_image_slices": getattr(_tok, "joint_image_slices", None),
+                    "gen_image_slices": getattr(_tok, "gen_image_slices", None),
+                    "cond_vae_image_slices": getattr(_tok, "cond_vae_image_slices", None),
+                    "cond_vit_image_slices": getattr(_tok, "cond_vit_image_slices", None),
+                    "real_pos_shape": (
+                        list(_tok.real_pos.shape) if hasattr(_tok, "real_pos") and _tok.real_pos is not None else None
+                    ),
+                    "tokens_shape": (
+                        list(_tok.tokens.shape) if hasattr(_tok, "tokens") and _tok.tokens is not None else None
+                    ),
+                },
+            )
+            for _tk in (
+                "tokens",
+                "gen_image_mask",
+                "cond_vae_image_mask",
+                "cond_vit_image_mask",
+                "gen_timestep_scatter_index",
+                "guidance_scatter_index",
+                "timestep_r_scatter_index",
+                "cond_timestep_scatter_index",
+                "real_pos",
+            ):
+                _v = getattr(_tok, _tk, None)
+                if _v is not None and isinstance(_v, torch.Tensor):
+                    _hy3_dump(f"pipeline.tokenizer_output.{_tk}", _v)
+
         outputs = self._generate(**model_inputs, **kwargs)
         result = outputs[0]
+        # -------- HY3 DUMP: _generate 输出（VAE 后的最终 image / latents） --------
+        _hy3_dump(
+            "pipeline.generate_result_summary",
+            {
+                "type": type(result).__name__,
+                "is_list": isinstance(result, list),
+                "len": len(result) if isinstance(result, list) else None,
+                "elem0_type": type(result[0]).__name__ if isinstance(result, list) and result else None,
+            },
+        )
+        if isinstance(result, torch.Tensor):
+            _hy3_dump("pipeline.generate_result", result)
+        elif isinstance(result, list) and result and isinstance(result[0], torch.Tensor):
+            _hy3_dump("pipeline.generate_result[0]", result[0])
 
         metadata = {}
         if any(t is not None for t in cot_text_list):

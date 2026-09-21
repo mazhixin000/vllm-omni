@@ -86,6 +86,195 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Debug tensor dumping utility for NPU vs GPU精度对齐
+#
+# 使用方式：
+#   HY3_DUMP=1                        启用打点（默认 0 = 关闭，零开销）
+#   HY3_DUMP_DIR=/some/path           保存目录（默认 ./hy3_dump）
+#   HY3_DUMP_FULL=1                   同时保存完整 tensor 为 .pt（默认只保存 stats）
+#   HY3_DUMP_STEPS=0,1,-1             只在这几个 denoise step 打点（默认全部；-1=最后一步）
+#   HY3_DUMP_LAYERS=0,15,31           只在这几个 decoder layer 打点（默认全部；-1=最后一层）
+#
+# 每次调用 _hy3_dump(name, tensor, step=?, layer=?) 都会：
+#   1) 写一行 stats 到 <dir>/rank<r>/summary.jsonl
+#      （shape/dtype/device/md5/min/max/mean/std/前后 8 元素）
+#   2) 若 HY3_DUMP_FULL=1，则同时把 tensor 保存为 <dir>/rank<r>/<sanitized_name>.pt
+#      文件名带 step/layer 前缀，天然可 diff
+#
+# NPU 和 GPU 两侧只需用相同 HY3_DUMP_DIR 结构复制/挂载后跑一次，
+# 用 diff <(sort A/summary.jsonl) <(sort B/summary.jsonl) 就能一次性锁定分叉点。
+# ---------------------------------------------------------------------------
+
+_hy3_dump_enabled: bool | None = None
+_hy3_dump_dir: str = "./hy3_dump"
+_hy3_dump_full: bool = False
+_hy3_dump_steps: set[int] | None = None  # None = all
+_hy3_dump_layers: set[int] | None = None  # None = all
+_hy3_dump_rank: int = -1
+_hy3_dump_summary_fp = None  # opened file handle
+_hy3_dump_skip_dummy: bool = True  # skip warmup / dummy_req_id calls
+_hy3_dump_active: bool = True  # gated per-request; True by default so non-pipeline callers also work
+
+
+def _hy3_dump_init() -> bool:
+    """Lazy-init dumper state; return True if enabled."""
+    global _hy3_dump_enabled, _hy3_dump_dir, _hy3_dump_full
+    global _hy3_dump_steps, _hy3_dump_layers, _hy3_dump_rank, _hy3_dump_summary_fp
+
+    if _hy3_dump_enabled is not None:
+        return _hy3_dump_enabled
+
+    if os.environ.get("HY3_DUMP", "0") not in ("1", "true", "TRUE", "on", "ON"):
+        _hy3_dump_enabled = False
+        return False
+
+    _hy3_dump_dir = os.environ.get("HY3_DUMP_DIR", "./hy3_dump")
+    _hy3_dump_full = os.environ.get("HY3_DUMP_FULL", "0") in ("1", "true", "TRUE", "on", "ON")
+    # HY3_DUMP_SKIP_DUMMY=0 时才收集 dummy_req_id 的 warmup 数据
+    global _hy3_dump_skip_dummy
+    _hy3_dump_skip_dummy = os.environ.get("HY3_DUMP_SKIP_DUMMY", "1") in ("1", "true", "TRUE", "on", "ON")
+
+    steps_env = os.environ.get("HY3_DUMP_STEPS", "").strip()
+    layers_env = os.environ.get("HY3_DUMP_LAYERS", "").strip()
+    _hy3_dump_steps = {int(x) for x in steps_env.split(",") if x} if steps_env else None
+    _hy3_dump_layers = {int(x) for x in layers_env.split(",") if x} if layers_env else None
+
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        _hy3_dump_rank = get_tensor_model_parallel_rank()
+    except Exception:
+        _hy3_dump_rank = int(os.environ.get("RANK", "0"))
+
+    rank_dir = os.path.join(_hy3_dump_dir, f"rank{_hy3_dump_rank}")
+    os.makedirs(rank_dir, exist_ok=True)
+    _hy3_dump_summary_fp = open(  # noqa: SIM115
+        os.path.join(rank_dir, "summary.jsonl"), "a", buffering=1
+    )
+    logger.warning(
+        "[HY3_DUMP] enabled dir=%s full=%s steps=%s layers=%s rank=%s",
+        _hy3_dump_dir, _hy3_dump_full, _hy3_dump_steps, _hy3_dump_layers, _hy3_dump_rank,
+    )
+    _hy3_dump_enabled = True
+    return True
+
+
+def _hy3_auto_step() -> int | None:
+    """Best-effort fetch of current denoise step from forward context."""
+    try:
+        from vllm_omni.diffusion import forward_context as _fc
+
+        ctx = getattr(_fc, "_forward_context", None)
+        if ctx is None:
+            return None
+        return getattr(ctx, "denoise_step_idx", None)
+    except Exception:
+        return None
+
+
+def _hy3_should_dump(step: int | None, layer: int | None) -> bool:
+    if not _hy3_dump_init():
+        return False
+    if _hy3_dump_skip_dummy and not _hy3_dump_active:
+        return False
+    if step is None:
+        step = _hy3_auto_step()
+    if step is not None and _hy3_dump_steps is not None and step not in _hy3_dump_steps:
+        return False
+    if layer is not None and _hy3_dump_layers is not None and layer not in _hy3_dump_layers:
+        return False
+    return True
+
+
+def _hy3_set_active(is_dummy: bool) -> None:
+    """Called from pipeline.forward once we know if this call is warmup/dummy."""
+    global _hy3_dump_active
+    _hy3_dump_active = not is_dummy
+
+
+def _hy3_dump(
+    name: str,
+    tensor,
+    *,
+    step: int | None = None,
+    layer: int | None = None,
+    extra: dict | None = None,
+) -> None:
+    """Save tensor stats (and optionally full tensor) for cross-device diff.
+
+    Silently no-op unless HY3_DUMP=1. Never raises.
+    """
+    if not _hy3_should_dump(step, layer):
+        return
+    if step is None:
+        step = _hy3_auto_step()
+    try:
+        import hashlib
+        import json as _json
+
+        fp = _hy3_dump_summary_fp
+        if fp is None:
+            return
+
+        if tensor is None:
+            payload = {
+                "name": name, "step": step, "layer": layer, "value": None,
+                "extra": extra or {},
+            }
+            fp.write(_json.dumps(payload) + "\n")
+            return
+
+        if not isinstance(tensor, torch.Tensor):
+            payload = {
+                "name": name, "step": step, "layer": layer,
+                "type": type(tensor).__name__, "repr": repr(tensor)[:512],
+                "extra": extra or {},
+            }
+            fp.write(_json.dumps(payload) + "\n")
+            return
+
+        t = tensor.detach()
+        t_cpu = t.to(dtype=torch.float32, device="cpu", copy=False)
+        arr = t_cpu.contiguous().numpy()
+        md5 = hashlib.md5(arr.tobytes()).hexdigest()  # noqa: S324
+
+        flat = arr.reshape(-1)
+        head = flat[:8].tolist()
+        tail = flat[-8:].tolist() if flat.size > 8 else []
+
+        payload = {
+            "name": name,
+            "step": step,
+            "layer": layer,
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "device": str(tensor.device),
+            "md5": md5,
+            "min": float(flat.min()) if flat.size else 0.0,
+            "max": float(flat.max()) if flat.size else 0.0,
+            "mean": float(flat.mean()) if flat.size else 0.0,
+            "std": float(flat.std()) if flat.size else 0.0,
+            "head": head,
+            "tail": tail,
+            "extra": extra or {},
+        }
+        fp.write(_json.dumps(payload) + "\n")
+
+        if _hy3_dump_full:
+            parts = []
+            if step is not None:
+                parts.append(f"s{step:03d}")
+            if layer is not None:
+                parts.append(f"l{layer:03d}")
+            parts.append(name.replace("/", "_").replace(" ", "_"))
+            fname = "-".join(parts) + ".pt"
+            rank_dir = os.path.join(_hy3_dump_dir, f"rank{_hy3_dump_rank}")
+            torch.save(t_cpu, os.path.join(rank_dir, fname))
+    except Exception as e:  # pragma: no cover - never let dump crash the model
+        logger.warning("[HY3_DUMP] dump %s failed: %r", name, e)
+
 _HUNYUAN_IMAGE3_COMPRESSED_KV_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_COMPRESSED_KV"
 _HUNYUAN_IMAGE3_BSND_ATTN_ENV = "VLLM_OMNI_HUNYUAN_IMAGE3_BSND_ATTENTION"
 _DISABLED_OPTIMIZATION_VALUES = frozenset({"0", "false", "no", "off", "disabled", "disable"})
@@ -1352,6 +1541,12 @@ class ImageKVCacheManager:
                 full_attn_spans=full_attn_spans,
             )
         attn_output = self.attn(query, key, value, attn_metadata)
+        _layer = getattr(self, "_hy3_layer_idx", None)
+        _hy3_dump("image_attn.in.q", query, layer=_layer)
+        _hy3_dump("image_attn.in.k", key, layer=_layer)
+        _hy3_dump("image_attn.in.v", value, layer=_layer)
+        _hy3_dump("image_attn.in.mask", attention_mask, layer=_layer)
+        _hy3_dump("image_attn.out", attn_output, layer=_layer)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
         return attn_output
 
@@ -2016,14 +2211,20 @@ class HunYuanAttention(nn.Module):
             k = self.key_layernorm(k.view(-1, self.num_kv_heads, self.head_dim).contiguous())
         # for image_generation
         if kwargs.get("mode", "gen_text") == "gen_image":
+            self.image_attn._hy3_layer_idx = self.layer_id  # type: ignore[attr-defined]
+            _hy3_dump("attn.qkv_post_rope.q", q, layer=self.layer_id)
+            _hy3_dump("attn.qkv_post_rope.k", k, layer=self.layer_id)
+            _hy3_dump("attn.qkv_post_rope.v", v, layer=self.layer_id)
             attn_output = self.image_attn(q, k, v, attention_mask=attention_mask, **kwargs)
         else:
             attn_output = self.attn(q, k, v)
         # For o_proj
         # image_attn may return a non-contiguous tensor; reshape is safe here.
         attn_output = attn_output.reshape(q.shape[0], -1)
+        _hy3_dump("attn.pre_oproj", attn_output, layer=self.layer_id)
         output, _ = self.o_proj(attn_output)
         output = output.reshape(bsz, q_len, -1)
+        _hy3_dump("attn.post_oproj", output, layer=self.layer_id)
         return output, None, past_key_value
 
 
@@ -2125,6 +2326,8 @@ class HunyuanImage3DecoderLayer(nn.Module):
             )
 
         residual = hidden_states
+        _lid = self.layer_idx
+        _hy3_dump("layer.in", hidden_states, layer=_lid)
         cross_layer_norm = precomputed_input_norm is not None or next_input_layernorm is not None
         if precomputed_input_norm is None:
             hidden_states = self.input_layernorm(hidden_states)
@@ -2139,6 +2342,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
             if precomputed_input_norm.dtype != hidden_states.dtype:
                 raise ValueError("Precomputed input norm must have the same dtype as hidden states")
             hidden_states = precomputed_input_norm
+        _hy3_dump("layer.after_input_norm", hidden_states, layer=_lid)
 
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -2150,6 +2354,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
             use_cache=use_cache,
             **kwargs,
         )
+        _hy3_dump("layer.after_self_attn", hidden_states, layer=_lid)
         # Fuse the post-attention residual add with RMSNorm on supported NPU
         # platforms; other platforms and disabled configurations use the same
         # model-level helper's separate Add + RMSNorm fallback.
@@ -2158,8 +2363,10 @@ class HunyuanImage3DecoderLayer(nn.Module):
             hidden_states,
             residual,
         )
+        _hy3_dump("layer.after_post_attn_norm", hidden_states, layer=_lid)
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
+        _hy3_dump("layer.after_mlp", hidden_states, layer=_lid)
 
         # Fuse this layer's final residual add with the next layer's input
         # RMSNorm. The normalized tensor is returned to the model loop as
@@ -2173,6 +2380,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
                 hidden_states,
                 residual,
             )
+        _hy3_dump("layer.out", hidden_states, layer=_lid)
 
         outputs = (hidden_states,)
 
@@ -2665,6 +2873,8 @@ class HunyuanImage3Model(nn.Module):
 
         # embed positions
         hidden_states = inputs_embeds
+        _hy3_dump("model.after_embed", hidden_states)
+        _hy3_dump("model.attention_mask", attention_mask)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -2790,6 +3000,7 @@ class HunyuanImage3Model(nn.Module):
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+        _hy3_dump("model.after_all_layers", hidden_states)
         if sp_world_size > 1:
             text_output, image_output = self._split_result(hidden_states, prompt_size)
             hidden_states = self.post_processor(image_output)
@@ -2797,6 +3008,7 @@ class HunyuanImage3Model(nn.Module):
             # Since the SP system only records the primary padding information from the first stage,
             # but different stages may introduce different padding sizes, we truncate it to ensure correct output.
             hidden_states = hidden_states[:, :origin_query_len, :].contiguous()
+            _hy3_dump("model.after_sp_gather", hidden_states)
 
         next_cache = None
         if use_cache:
@@ -2974,13 +3186,16 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         if latents is None:
             latents = randn_tensor(latents_shape, generator=generator, device=device, dtype=dtype)
+            _hy3_dump("prepare_latents.randn", latents, extra={"shape": latents_shape})
         else:
             latents = latents.to(device)
+            _hy3_dump("prepare_latents.user_provided", latents, extra={"shape": latents_shape})
 
         # Check existence to make it compatible with FlowMatchEulerDiscreteScheduler
         if hasattr(self.scheduler, "init_noise_sigma"):
             # scale the initial noise by the standard deviation required by the scheduler
             latents = latents * self.scheduler.init_noise_sigma
+        _hy3_dump("prepare_latents.final", latents)
 
         return latents
 
@@ -3498,6 +3713,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                         model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
                         pred = model_output["diffusion_prediction"]
                     pred = pred.to(dtype=torch.float32)
+                    _hy3_dump("denoise.pred_raw", pred, step=i)
 
                     if tea_cache_config is not None:
                         tc_prev_pred = pred.clone()
@@ -3512,12 +3728,16 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     pred = self.cfg_operator(gathered[0], gathered[1], self.guidance_scale, step=i)
                 elif self.do_classifier_free_guidance and not cfg_distilled:
                     pred_cond, pred_uncond = pred.chunk(2)
+                    _hy3_dump("denoise.pred_cond", pred_cond, step=i)
+                    _hy3_dump("denoise.pred_uncond", pred_uncond, step=i)
                     pred = self.cfg_operator(pred_cond, pred_uncond, self.guidance_scale, step=i)
                 if self.do_classifier_free_guidance and not cfg_distilled and self.guidance_rescale > 0.0:
                     pred = rescale_noise_cfg(pred, pred_cond, guidance_rescale=self.guidance_rescale)
+                _hy3_dump("denoise.pred_final", pred, step=i)
 
                 # Scheduler step (all ranks compute locally in CFG parallel)
                 latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
+                _hy3_dump("denoise.latents", latents, step=i)
                 if i != len(timesteps) - 1 and should_compute:
                     model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa
                         model_output,
@@ -3562,8 +3782,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         if hasattr(self.vae, "ffactor_temporal"):
             latents = latents.unsqueeze(2)
 
+        _hy3_dump("vae.in.latents", latents)
         with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=True):
             image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+        _hy3_dump("vae.out.image", image)
 
         if hasattr(self.vae, "ffactor_temporal"):
             assert image.shape[2] == 1, "image should have shape [B, C, T, H, W] and T should be 1"
