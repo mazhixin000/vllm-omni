@@ -2685,6 +2685,7 @@ class HunyuanImage3Pipeline(
                     "metadata": metadata,
                 },
                 stage_durations=getattr(self, "stage_durations", None),
+                to_cpu=True,
             )
         if self.vae is None:
             raise RuntimeError("HunyuanImage3 VAE is unavailable for image output.")
@@ -2937,4 +2938,5 @@ class HunyuanImage3Pipeline(
                 "metadata": metadata,
             },
             stage_durations=stage_durations,
+            to_cpu=self._latent_only,
         )
